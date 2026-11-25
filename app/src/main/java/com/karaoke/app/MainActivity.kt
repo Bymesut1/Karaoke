@@ -105,6 +105,33 @@ class MainActivity : Activity() {
         else "Hata kaydı kopyalandı. Bana yapıştır."
     }
 
+    // ---------- Senkron ----------
+    private fun shift(ms: Long) {
+        offsetMs += ms
+        status.text = "Söz kaydırma: ${"%.1f".format(offsetMs / 1000.0)} sn"
+    }
+
+    private fun currentLineIndex(pos: Long): Int {
+        var idx = -1
+        for (i in lines.indices) {
+            if (lines[i].start <= pos) idx = i else break
+        }
+        return idx
+    }
+
+    private fun syncToNow() {
+        val p = player
+        if (p == null || !running || lines.isEmpty()) {
+            status.text = "Önce BAŞLA'ya bas. Şarkı çalarken, sıradaki satırın başlaması gereken anda bu tuşa bas."
+            return
+        }
+        val rawPos = p.currentPosition.toLong()
+        val idx = currentLineIndex(rawPos - offsetMs)
+        val target = (idx + 1).coerceIn(0, lines.size - 1)
+        offsetMs = rawPos - lines[target].start
+        status.text = "Senkron ayarlandı. Kaydırma: ${"%.1f".format(offsetMs / 1000.0)} sn"
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         NewPipe.init(DownloaderImpl())
@@ -147,10 +174,10 @@ class MainActivity : Activity() {
 
         val offsetRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            addView(btn("Söz -0.5s") { offsetMs -= 500; status.text = "Kaydırma: ${offsetMs} ms" },
-                LinearLayout.LayoutParams(0, -2, 1f))
-            addView(btn("Söz +0.5s") { offsetMs += 500; status.text = "Kaydırma: ${offsetMs} ms" },
-                LinearLayout.LayoutParams(0, -2, 1f))
+            addView(btn("-2s") { shift(-2000) }, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(btn("-0.5s") { shift(-500) }, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(btn("+0.5s") { shift(500) }, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(btn("+2s") { shift(2000) }, LinearLayout.LayoutParams(0, -2, 1f))
         }
 
         root.addView(status)
@@ -163,10 +190,11 @@ class MainActivity : Activity() {
         root.addView(btn("veya: LRC dosyası seç") { pickFile(2) })
         root.addView(vocalBtn)
         root.addView(btn("BAŞLA") { onStartClicked() })
+        root.addView(btn("SIRADAKİ SATIR ŞİMDİ BAŞLIYOR (senkron)") { syncToNow() })
+        root.addView(offsetRow)
         root.addView(btn("DURDUR") { stopSession() })
         root.addView(btn("Kaydı dinle") { playRecording() })
         root.addView(btn("HATA KAYDINI KOPYALA") { copyError() })
-        root.addView(offsetRow)
         root.addView(lyricView, LinearLayout.LayoutParams(-1, 0, 1f))
         root.addView(nextView)
 
@@ -178,6 +206,7 @@ class MainActivity : Activity() {
         status.text = "Aranıyor..."
         streamUrl = null
         audioUri = null
+        offsetMs = 0
         Thread {
             try {
                 val service = ServiceList.YouTube
@@ -193,7 +222,7 @@ class MainActivity : Activity() {
                     .take(3)
                 if (items.isEmpty()) throw Exception("Sonuç bulunamadı")
 
-                var found: Pair<String, String>? = null
+                var found: Triple<String, String, Long>? = null
                 var lastEx: Throwable? = null
                 for (item in items) {
                     try {
@@ -203,7 +232,7 @@ class MainActivity : Activity() {
                             .maxByOrNull { it.averageBitrate }
                             ?: info.audioStreams.firstOrNull()
                             ?: throw Exception("Ses akışı yok")
-                        found = Pair(item.name, audio.content)
+                        found = Triple(item.name, audio.content, info.duration)
                         break
                     } catch (e: Exception) {
                         lastEx = e
@@ -214,16 +243,28 @@ class MainActivity : Activity() {
 
                 val title = found.first
                 val url = found.second
+                val videoSec = found.third
                 runOnUiThread { status.text = "Müzik bulundu: $title\nSözler aranıyor..." }
 
-                val lrc = fetchLyrics(q)
+                val lrc = fetchLyrics(q, videoSec)
                 runOnUiThread {
                     streamUrl = url
                     vocalRemove = false // karaoke videosu zaten vokalsiz
                     updateVocalBtn()
+                    offsetMs = 0
                     if (lrc != null) {
-                        lines = parseLrc(lrc)
-                        status.text = "Hazır: $title\n${lines.size} satır söz. BAŞLA'ya bas."
+                        lines = parseLrc(lrc.first)
+                        var autoMsg = ""
+                        val lrcDur = lrc.second
+                        if (lrcDur > 0 && videoSec > 0) {
+                            val diff = videoSec - lrcDur
+                            if (diff >= 2.0 && diff <= 20.0) {
+                                offsetMs = (diff * 1000).toLong()
+                                autoMsg = "\nOtomatik kaydırma (tahmin): +${"%.1f".format(diff)} sn"
+                            }
+                        }
+                        status.text = "Hazır: $title\n${lines.size} satır söz.$autoMsg\n" +
+                            "Kayıyorsa çalarken SENKRON tuşunu kullan."
                     } else {
                         lines = emptyList()
                         status.text = "Hazır: $title\nSöz bulunamadı (sadece müzik çalar)."
@@ -239,21 +280,29 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    private fun fetchLyrics(q: String): String? {
+    /** Süresi videoya en yakın zaman damgalı sözü seçer. Döner: (LRC metni, süre sn) */
+    private fun fetchLyrics(q: String, videoSec: Long): Pair<String, Double>? {
         return try {
             val u = "https://lrclib.net/api/search?q=" + URLEncoder.encode(q, "UTF-8")
             val conn = URL(u).openConnection()
-            conn.setRequestProperty("User-Agent", "KaraokeApp/3.1")
+            conn.setRequestProperty("User-Agent", "KaraokeApp/3.2")
             val txt = conn.getInputStream().bufferedReader().use { it.readText() }
             val arr = JSONArray(txt)
+            var best: Pair<String, Double>? = null
+            var bestDiff = Double.MAX_VALUE
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
-                if (!o.isNull("syncedLyrics")) {
-                    val s = o.getString("syncedLyrics")
-                    if (s.isNotBlank()) return s
+                if (o.isNull("syncedLyrics")) continue
+                val s = o.getString("syncedLyrics")
+                if (s.isBlank()) continue
+                val d = if (o.isNull("duration")) -1.0 else o.getDouble("duration")
+                val diff = if (d > 0 && videoSec > 0) Math.abs(videoSec - d) else 1e9
+                if (best == null || diff < bestDiff) {
+                    best = Pair(s, d)
+                    bestDiff = diff
                 }
             }
-            null
+            best
         } catch (e: Exception) {
             logError("söz arama", e)
             null
@@ -277,6 +326,7 @@ class MainActivity : Activity() {
             audioUri = uri
             streamUrl = null
             vocalRemove = true
+            offsetMs = 0
             updateVocalBtn()
             status.text = "Müzik dosyası seçildi. Vokal silme AÇIK."
         } else if (requestCode == 2) {
@@ -284,6 +334,7 @@ class MainActivity : Activity() {
                 val text = contentResolver.openInputStream(uri)!!
                     .bufferedReader().use { it.readText() }
                 lines = parseLrc(text)
+                offsetMs = 0
                 status.text = "${lines.size} satır söz yüklendi."
             } catch (e: Exception) {
                 logError("LRC okuma", e)
@@ -384,10 +435,7 @@ class MainActivity : Activity() {
             lyricView.text = "♪"
             return
         }
-        var idx = -1
-        for (i in lines.indices) {
-            if (lines[i].start <= pos) idx = i else break
-        }
+        val idx = currentLineIndex(pos)
         if (idx == -1) {
             lyricView.text = "♪ ♪ ♪"
             nextView.text = lines[0].words.joinToString(" ") { it.text }

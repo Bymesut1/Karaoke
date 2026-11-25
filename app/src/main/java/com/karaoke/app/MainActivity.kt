@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -13,8 +14,10 @@ import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.provider.MediaStore
 import android.text.Spannable
 import android.text.SpannableString
 import android.text.style.ForegroundColorSpan
@@ -22,6 +25,7 @@ import android.view.Gravity
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import org.json.JSONArray
 import org.schabi.newpipe.extractor.MediaFormat
@@ -53,21 +57,109 @@ class MainActivity : Activity() {
     private var recFile: File? = null
     private var running = false
     private var offsetMs = 0L
-    private var vocalRemove = true
     private var sessionId = 0
 
-    @Volatile private var lastError = ""
+    private var stage = 0            // 0 boşta, 1 analiz+sesli çalma, 2 vokalsiz çalma+kayıt
+    private var stage1Active = false
+    private var p1Finished = false
+    private var analysis: VocalRemover.Result? = null
+    private var instrFile: File? = null
+    private var syncNote = ""
+
+    private val dbg = StringBuilder()
 
     private lateinit var input: EditText
     private lateinit var lyricView: TextView
     private lateinit var nextView: TextView
     private lateinit var status: TextView
-    private lateinit var vocalBtn: Button
     private val handler = Handler(Looper.getMainLooper())
 
     private val BLUE = Color.parseColor("#2196F3")
     private val WHITE = Color.WHITE
 
+    // ---------- günlük / debug ----------
+    private fun dlog(msg: String) {
+        synchronized(dbg) {
+            val t = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+            dbg.append("[").append(t).append("] ").append(msg).append("\n")
+            if (dbg.length > 30000) dbg.delete(0, dbg.length - 30000)
+        }
+    }
+
+    private fun logError(where: String, e: Throwable) {
+        val sw = StringWriter()
+        e.printStackTrace(PrintWriter(sw))
+        dlog("HATA @ $where: ${e.javaClass.name}: ${e.message}\n${sw.toString().take(2500)}")
+    }
+
+    private fun copyToDownloads(src: File, name: String, mime: String): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                val cv = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                    put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                }
+                val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
+                    ?: return false
+                val os = contentResolver.openOutputStream(uri) ?: return false
+                os.use { out -> src.inputStream().use { it.copyTo(out) } }
+            } else {
+                val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                dir.mkdirs()
+                src.copyTo(File(dir, name), overwrite = true)
+            }
+            true
+        } catch (e: Exception) {
+            logError("Indirilenlere kopyalama ($name)", e)
+            false
+        }
+    }
+
+    private fun saveDebug() {
+        val sb = StringBuilder()
+        val now = Date()
+        sb.append("=== KARAOKE DEBUG ===\n")
+        sb.append("Zaman: ").append(SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(now)).append("\n")
+        sb.append("Cihaz: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.SDK_INT}\n")
+        sb.append("Asama: $stage\n")
+        sb.append("Kaynak: ${if (streamUrl != null) "YouTube" else if (audioUri != null) "dosya" else "yok"}\n")
+        sb.append("Soz satiri: ${lines.size}, ilk satir: ${lines.firstOrNull()?.start} ms\n")
+        val a = analysis
+        if (a != null) {
+            sb.append("Analiz: ok=${a.ok} ses girisi=${a.onsetMs} ms guven=${"%.1f".format(a.confDb)} dB " +
+                "guvenilir=${a.reliable} sure=${a.durationMs} ms not=${a.note}\n")
+        } else {
+            sb.append("Analiz: yok\n")
+        }
+        sb.append("Soz kaydirma (offset): $offsetMs ms\n")
+        sb.append("\n--- Olay gunlugu ---\n")
+        synchronized(dbg) { sb.append(dbg) }
+
+        val text = sb.toString()
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("karaoke debug", text))
+        } catch (_: Exception) {}
+
+        val name = "karaoke_debug_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(now) + ".txt"
+        status.text = "Debug kaydediliyor..."
+        Thread {
+            val ok = try {
+                val f = File(cacheDir, "debug.txt")
+                f.writeText(text)
+                copyToDownloads(f, name, "text/plain")
+            } catch (e: Exception) {
+                false
+            }
+            runOnUiThread {
+                status.text = if (ok) "Debug İndirilenler klasörüne kaydedildi:\n$name\n(Panoya da kopyalandı)"
+                else "İndirilenlere yazılamadı ama panoya kopyalandı. Bana yapıştır."
+            }
+        }.start()
+    }
+
+    // ---------- UI ----------
     private val ticker = object : Runnable {
         override fun run() {
             if (running) {
@@ -77,38 +169,95 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun updateVocalBtn() {
-        vocalBtn.text = if (vocalRemove) "Vokal silme: AÇIK" else "Vokal silme: KAPALI"
-    }
-
-    // ---------- Hata kaydı ----------
-    private fun logError(where: String, e: Throwable) {
-        try {
-            val sw = StringWriter()
-            e.printStackTrace(PrintWriter(sw))
-            val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
-            val entry = "[$time] $where\n" +
-                "Cihaz: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.SDK_INT}\n" +
-                "${e.javaClass.name}: ${e.message}\n" +
-                sw.toString().take(3500) + "\n\n"
-            lastError = (lastError + entry).takeLast(7000)
-            File(getExternalFilesDir(null), "hata.txt").writeText(lastError)
-        } catch (_: Exception) {
+    private val ticker1 = object : Runnable {
+        override fun run() {
+            if (!stage1Active) return
+            val a = analysis
+            if (a != null) {
+                val pos = try { player?.currentPosition?.toLong() ?: 0L } catch (_: Exception) { 0L }
+                if (!a.ok || p1Finished || pos >= a.onsetMs) {
+                    startStage2(true)
+                    return
+                }
+            }
+            handler.postDelayed(this, 100)
         }
     }
 
-    private fun copyError() {
-        val text = if (lastError.isBlank()) "Hata kaydı yok." else lastError
-        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        cm.setPrimaryClip(ClipData.newPlainText("hata", text))
-        status.text = if (lastError.isBlank()) "Henüz hata yok."
-        else "Hata kaydı kopyalandı. Bana yapıştır."
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        NewPipe.init(DownloaderImpl())
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#121212"))
+            setPadding(32, 64, 32, 24)
+        }
+
+        status = TextView(this).apply {
+            setTextColor(Color.LTGRAY); textSize = 13f
+            text = "Şarkı adını yaz (sanatçı + şarkı) ve Ara'ya bas."
+        }
+        input = EditText(this).apply {
+            hint = "örn: Tarkan Kuzu Kuzu"
+            setTextColor(WHITE); setHintTextColor(Color.GRAY)
+            setSingleLine(true)
+        }
+        lyricView = TextView(this).apply {
+            setTextColor(WHITE); textSize = 28f
+            gravity = Gravity.CENTER
+            setPadding(0, 24, 0, 16)
+        }
+        nextView = TextView(this).apply {
+            setTextColor(Color.GRAY); textSize = 20f
+            gravity = Gravity.CENTER
+        }
+
+        fun btn(label: String, onClick: () -> Unit) = Button(this).apply {
+            text = label
+            setOnClickListener { onClick() }
+        }
+
+        val offsetRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(btn("-2s") { shift(-2000) }, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(btn("-0.5s") { shift(-500) }, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(btn("+0.5s") { shift(500) }, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(btn("+2s") { shift(2000) }, LinearLayout.LayoutParams(0, -2, 1f))
+        }
+
+        val controls = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(btn("ARA (YouTube + söz)") {
+                val q = input.text.toString().trim()
+                if (q.isNotEmpty()) searchAndLoad(q)
+            })
+            addView(btn("veya: Müzik dosyası seç") { pickFile(1) })
+            addView(btn("veya: LRC dosyası seç") { pickFile(2) })
+            addView(btn("BAŞLA 1 (sesli çal + ses girişini bul)") { onStartClicked() })
+            addView(btn("BAŞLA 2 (vokalsiz müzik + kayıt)") { startStage2(false) })
+            addView(btn("DURDUR") { stopSession(); status.text = "Durduruldu." })
+            addView(offsetRow)
+            addView(btn("SENKRON: sıradaki satır ŞİMDİ başlıyor") { syncToNow() })
+            addView(btn("Kaydı dinle") { playRecording() })
+            addView(btn("DEBUG KAYDET (İndirilenler)") { saveDebug() })
+        }
+        val scroll = ScrollView(this).apply { addView(controls) }
+
+        root.addView(status)
+        root.addView(input)
+        root.addView(lyricView, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(nextView)
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1.3f))
+
+        setContentView(root)
     }
 
     // ---------- Senkron ----------
     private fun shift(ms: Long) {
         offsetMs += ms
         status.text = "Söz kaydırma: ${"%.1f".format(offsetMs / 1000.0)} sn"
+        dlog("Elle kaydirma: offset=$offsetMs")
     }
 
     private fun currentLineIndex(pos: Long): Int {
@@ -122,83 +271,15 @@ class MainActivity : Activity() {
     private fun syncToNow() {
         val p = player
         if (p == null || !running || lines.isEmpty()) {
-            status.text = "Önce BAŞLA'ya bas. Şarkı çalarken, sıradaki satırın başlaması gereken anda bu tuşa bas."
+            status.text = "Önce BAŞLA 2 çalışırken, sıradaki satırın başlaması gereken anda bas."
             return
         }
         val rawPos = p.currentPosition.toLong()
         val idx = currentLineIndex(rawPos - offsetMs)
         val target = (idx + 1).coerceIn(0, lines.size - 1)
         offsetMs = rawPos - lines[target].start
+        dlog("Elle senkron: offset=$offsetMs")
         status.text = "Senkron ayarlandı. Kaydırma: ${"%.1f".format(offsetMs / 1000.0)} sn"
-    }
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        NewPipe.init(DownloaderImpl())
-
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#121212"))
-            setPadding(32, 64, 32, 32)
-        }
-
-        status = TextView(this).apply {
-            setTextColor(Color.LTGRAY); textSize = 14f
-            text = "Şarkı adını yaz (sanatçı + şarkı) ve Ara'ya bas."
-        }
-        input = EditText(this).apply {
-            hint = "örn: Tarkan Kuzu Kuzu"
-            setTextColor(WHITE); setHintTextColor(Color.GRAY)
-            setSingleLine(true)
-        }
-        lyricView = TextView(this).apply {
-            setTextColor(WHITE); textSize = 28f
-            gravity = Gravity.CENTER
-            setPadding(0, 80, 0, 24)
-        }
-        nextView = TextView(this).apply {
-            setTextColor(Color.GRAY); textSize = 20f
-            gravity = Gravity.CENTER
-        }
-
-        fun btn(label: String, onClick: () -> Unit) = Button(this).apply {
-            text = label
-            setOnClickListener { onClick() }
-        }
-
-        vocalBtn = btn("") {
-            vocalRemove = !vocalRemove
-            updateVocalBtn()
-        }
-        updateVocalBtn()
-
-        val offsetRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(btn("-2s") { shift(-2000) }, LinearLayout.LayoutParams(0, -2, 1f))
-            addView(btn("-0.5s") { shift(-500) }, LinearLayout.LayoutParams(0, -2, 1f))
-            addView(btn("+0.5s") { shift(500) }, LinearLayout.LayoutParams(0, -2, 1f))
-            addView(btn("+2s") { shift(2000) }, LinearLayout.LayoutParams(0, -2, 1f))
-        }
-
-        root.addView(status)
-        root.addView(input)
-        root.addView(btn("ARA (YouTube karaoke + söz)") {
-            val q = input.text.toString().trim()
-            if (q.isNotEmpty()) searchAndLoad(q)
-        })
-        root.addView(btn("veya: Müzik dosyası seç") { pickFile(1) })
-        root.addView(btn("veya: LRC dosyası seç") { pickFile(2) })
-        root.addView(vocalBtn)
-        root.addView(btn("BAŞLA") { onStartClicked() })
-        root.addView(btn("SIRADAKİ SATIR ŞİMDİ BAŞLIYOR (senkron)") { syncToNow() })
-        root.addView(offsetRow)
-        root.addView(btn("DURDUR") { stopSession() })
-        root.addView(btn("Kaydı dinle") { playRecording() })
-        root.addView(btn("HATA KAYDINI KOPYALA") { copyError() })
-        root.addView(lyricView, LinearLayout.LayoutParams(-1, 0, 1f))
-        root.addView(nextView)
-
-        setContentView(root)
     }
 
     // ---------- YouTube (NewPipe) + LRCLIB ----------
@@ -206,12 +287,13 @@ class MainActivity : Activity() {
         status.text = "Aranıyor..."
         streamUrl = null
         audioUri = null
+        analysis = null
         offsetMs = 0
         Thread {
             try {
                 val service = ServiceList.YouTube
                 val qh = service.searchQHFactory.fromQuery(
-                    "$q karaoke instrumental",
+                    "$q official audio",
                     listOf(YoutubeSearchQueryHandlerFactory.VIDEOS),
                     ""
                 )
@@ -244,37 +326,26 @@ class MainActivity : Activity() {
                 val title = found.first
                 val url = found.second
                 val videoSec = found.third
-                runOnUiThread { status.text = "Müzik bulundu: $title\nSözler aranıyor..." }
+                dlog("Video: $title (${videoSec} sn)")
+                runOnUiThread { status.text = "Şarkı bulundu: $title\nSözler aranıyor..." }
 
                 val lrc = fetchLyrics(q, videoSec)
                 runOnUiThread {
                     streamUrl = url
-                    vocalRemove = false // karaoke videosu zaten vokalsiz
-                    updateVocalBtn()
-                    offsetMs = 0
                     if (lrc != null) {
                         lines = parseLrc(lrc.first)
-                        var autoMsg = ""
-                        val lrcDur = lrc.second
-                        if (lrcDur > 0 && videoSec > 0) {
-                            val diff = videoSec - lrcDur
-                            if (diff >= 2.0 && diff <= 20.0) {
-                                offsetMs = (diff * 1000).toLong()
-                                autoMsg = "\nOtomatik kaydırma (tahmin): +${"%.1f".format(diff)} sn"
-                            }
-                        }
-                        status.text = "Hazır: $title\n${lines.size} satır söz.$autoMsg\n" +
-                            "Kayıyorsa çalarken SENKRON tuşunu kullan."
+                        dlog("Soz: ${lines.size} satir, sure=${lrc.second} sn")
+                        status.text = "Hazır: $title\n${lines.size} satır söz. BAŞLA 1'e bas."
                     } else {
                         lines = emptyList()
-                        status.text = "Hazır: $title\nSöz bulunamadı (sadece müzik çalar)."
+                        status.text = "Hazır: $title\nSöz bulunamadı (sadece müzik çalar). BAŞLA 1'e bas."
                     }
                 }
             } catch (e: Exception) {
                 logError("arama: $q", e)
                 runOnUiThread {
                     status.text = "Hata: ${e.javaClass.simpleName}: ${e.message}\n" +
-                        "('Hata kaydını kopyala' butonuna bas)"
+                        "('DEBUG KAYDET' butonuna bas)"
                 }
             }
         }.start()
@@ -285,7 +356,7 @@ class MainActivity : Activity() {
         return try {
             val u = "https://lrclib.net/api/search?q=" + URLEncoder.encode(q, "UTF-8")
             val conn = URL(u).openConnection()
-            conn.setRequestProperty("User-Agent", "KaraokeApp/3.2")
+            conn.setRequestProperty("User-Agent", "KaraokeApp/4.0")
             val txt = conn.getInputStream().bufferedReader().use { it.readText() }
             val arr = JSONArray(txt)
             var best: Pair<String, Double>? = null
@@ -325,16 +396,14 @@ class MainActivity : Activity() {
         if (requestCode == 1) {
             audioUri = uri
             streamUrl = null
-            vocalRemove = true
+            analysis = null
             offsetMs = 0
-            updateVocalBtn()
-            status.text = "Müzik dosyası seçildi. Vokal silme AÇIK."
+            status.text = "Müzik dosyası seçildi. BAŞLA 1'e bas."
         } else if (requestCode == 2) {
             try {
                 val text = contentResolver.openInputStream(uri)!!
                     .bufferedReader().use { it.readText() }
                 lines = parseLrc(text)
-                offsetMs = 0
                 status.text = "${lines.size} satır söz yüklendi."
             } catch (e: Exception) {
                 logError("LRC okuma", e)
@@ -446,65 +515,140 @@ class MainActivity : Activity() {
             lines[idx + 1].words.joinToString(" ") { it.text } else ""
     }
 
-    // ---------- Oynat + Kaydet ----------
+    // ---------- Başlat 1 ----------
     private fun onStartClicked() {
         if (streamUrl == null && audioUri == null) {
             status.text = "Önce şarkı ara veya müzik dosyası seç."
             return
         }
+        val need = mutableListOf<String>()
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 10)
+            need.add(Manifest.permission.RECORD_AUDIO)
+        }
+        if (Build.VERSION.SDK_INT < 29 &&
+            checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
+        ) {
+            need.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        }
+        if (need.isNotEmpty()) {
+            requestPermissions(need.toTypedArray(), 10)
             return
         }
-        startSession()
+        startStage1()
     }
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, res: IntArray) {
         super.onRequestPermissionsResult(code, perms, res)
-        if (code == 10 && res.isNotEmpty() && res[0] == PackageManager.PERMISSION_GRANTED) {
-            startSession()
-        } else {
-            status.text = "Mikrofon izni gerekli."
+        if (code == 10) {
+            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                startStage1()
+            } else {
+                status.text = "Mikrofon izni gerekli."
+            }
         }
     }
 
-    private fun startSession() {
+    private fun setSource(p: MediaPlayer, processed: File?) {
+        val url = streamUrl
+        if (processed != null) {
+            p.setDataSource(processed.absolutePath)
+        } else if (url != null) {
+            p.setDataSource(this, Uri.parse(url), mapOf("User-Agent" to DownloaderImpl.USER_AGENT))
+        } else {
+            p.setDataSource(this, audioUri!!)
+        }
+    }
+
+    private fun startStage1() {
         stopSession()
         val myId = ++sessionId
+        stage = 1
+        stage1Active = true
+        p1Finished = false
+        analysis = null
+        instrFile = null
+        offsetMs = 0
+        val hint = lines.firstOrNull()?.start ?: 0L
+        dlog("BASLA1: hint(ilk soz satiri)=$hint ms")
+        status.text = "Başlat 1: şarkı çalıyor, sesin girdiği an aranıyor..."
 
-        if (!vocalRemove) {
-            beginPlayback(null)
-            return
+        try {
+            val p = MediaPlayer()
+            setSource(p, null)
+            p.setOnPreparedListener { it.start() }
+            p.setOnCompletionListener { p1Finished = true }
+            p.setOnErrorListener { _, what, extra ->
+                dlog("Asama1 MediaPlayer hata $what/$extra")
+                p1Finished = true
+                true
+            }
+            player = p
+            p.prepareAsync()
+        } catch (e: Exception) {
+            logError("asama1 calma", e)
+            p1Finished = true
         }
+        handler.post(ticker1)
 
-        status.text = "Vokal ayrılıyor... %0"
         Thread {
             try {
                 val outFile = File(cacheDir, "instrumental.wav")
-                val ok = VocalRemover.process(this, streamUrl, audioUri, outFile) { pct ->
+                val res = VocalRemover.process(this, streamUrl, audioUri, outFile, hint) { pct ->
                     runOnUiThread {
-                        if (myId == sessionId) status.text = "Vokal ayrılıyor... %$pct"
+                        if (myId == sessionId && stage == 1) {
+                            status.text = "Başlat 1: analiz %$pct"
+                        }
                     }
                 }
                 runOnUiThread {
                     if (myId != sessionId) return@runOnUiThread
-                    if (ok) {
-                        beginPlayback(outFile)
-                    } else {
-                        status.text = "Bu şarkı stereo değil, vokal silinemedi. Orijinal çalınıyor."
-                        beginPlayback(null)
-                    }
+                    analysis = res
+                    instrFile = if (res.ok) outFile else null
+                    dlog("Analiz bitti: ok=${res.ok} onset=${res.onsetMs} guven=${res.confDb} " +
+                        "guvenilir=${res.reliable} sure=${res.durationMs} not=${res.note}")
+                    status.text = "Ses girişi: ${"%.1f".format(res.onsetMs / 1000.0)} sn " +
+                        "(güven ${"%.1f".format(res.confDb)} dB)\nBu ana gelince BAŞLA 2 otomatik başlayacak."
                 }
             } catch (e: Exception) {
-                logError("vokal ayırma", e)
+                logError("analiz", e)
                 runOnUiThread {
                     if (myId == sessionId) {
-                        status.text = "Vokal ayırma hatası: ${e.message}\n" +
-                            "('Hata kaydını kopyala' butonuna bas)"
+                        analysis = VocalRemover.Result(false, hint, 0f, false, 0, "hata: ${e.message}")
+                        status.text = "Analiz hatası: ${e.message}\n('DEBUG KAYDET' butonuna bas)"
                     }
                 }
             }
         }.start()
+    }
+
+    // ---------- Başlat 2 ----------
+    private fun startStage2(auto: Boolean) {
+        val a = analysis
+        if (a == null) {
+            status.text = "Önce BAŞLA 1'e bas, analiz bitsin."
+            return
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            status.text = "Mikrofon izni gerekli. BAŞLA 1'e bas."
+            return
+        }
+        stopSession() // aşama 1'i kapatır, analizi silmez
+        stage = 2
+
+        val first = lines.firstOrNull()?.start
+        offsetMs = if (first != null) a.onsetMs - first else 0L
+        dlog("BASLA2 (${if (auto) "otomatik" else "elle"}): onset=${a.onsetMs} ilkSoz=$first offset=$offsetMs " +
+            "guvenilir=${a.reliable} vokalsiz=${instrFile != null}")
+
+        syncNote = ""
+        if (!a.reliable) {
+            syncNote = "\n⚠ Senkron emin değil (güven ${"%.1f".format(a.confDb)} dB). " +
+                "Kayıyorsa -/+ ile düzelt, sonra DEBUG KAYDET."
+        }
+        if (!a.ok) {
+            syncNote += "\n(Vokal silinemedi: orijinal çalıyor)"
+        }
+        beginPlayback(instrFile)
     }
 
     private fun beginPlayback(processed: File?) {
@@ -523,36 +667,29 @@ class MainActivity : Activity() {
             recorder = r
 
             val p = MediaPlayer()
-            val url = streamUrl
-            if (processed != null) {
-                p.setDataSource(processed.absolutePath)
-            } else if (url != null) {
-                p.setDataSource(this, Uri.parse(url), mapOf("User-Agent" to DownloaderImpl.USER_AGENT))
-            } else {
-                p.setDataSource(this, audioUri!!)
-            }
+            setSource(p, processed)
             p.setOnPreparedListener {
                 try {
                     recorder?.start()
                     it.start()
                     running = true
                     handler.post(ticker)
-                    status.text = "Çalıyor ve kaydediyor... (kulaklık tak)"
+                    status.text = "Çalıyor ve kaydediyor... (kulaklık tak)$syncNote"
                 } catch (e: Exception) {
-                    logError("oynatma başlatma", e)
+                    logError("asama2 baslatma", e)
                     status.text = "Başlatılamadı: ${e.message}"
                     stopSession()
                 }
             }
             p.setOnErrorListener { _, what, extra ->
-                logError("MediaPlayer", Exception("what=$what extra=$extra"))
-                status.text = "Oynatma hatası ($what/$extra)\n('Hata kaydını kopyala' butonuna bas)"
+                logError("MediaPlayer asama2", Exception("what=$what extra=$extra"))
+                status.text = "Oynatma hatası ($what/$extra)\n('DEBUG KAYDET' butonuna bas)"
                 stopSession()
                 true
             }
             p.setOnCompletionListener { stopSession() }
             player = p
-            status.text = "Müzik yükleniyor..."
+            status.text = "Başlat 2: müzik yükleniyor..."
             p.prepareAsync()
         } catch (e: Exception) {
             logError("beginPlayback", e)
@@ -564,15 +701,30 @@ class MainActivity : Activity() {
     private fun stopSession() {
         sessionId++
         running = false
+        stage1Active = false
+        stage = 0
         handler.removeCallbacks(ticker)
+        handler.removeCallbacks(ticker1)
+        val hadRecorder = recorder != null
         try { recorder?.stop() } catch (_: Exception) {}
         try { recorder?.release() } catch (_: Exception) {}
         recorder = null
         try { player?.stop() } catch (_: Exception) {}
         try { player?.release() } catch (_: Exception) {}
         player = null
-        recFile?.let {
-            if (it.exists() && it.length() > 0) status.text = "Kayıt: ${it.absolutePath}"
+
+        if (hadRecorder) {
+            val f = recFile
+            if (f != null && f.exists() && f.length() > 0) {
+                status.text = "Kayıt kaydediliyor..."
+                Thread {
+                    val ok = copyToDownloads(f, f.name, "audio/mp4")
+                    runOnUiThread {
+                        status.text = if (ok) "Kayıt İndirilenler klasörüne kaydedildi:\n${f.name}"
+                        else "İndirilenlere yazılamadı. Kayıt burada: ${f.absolutePath}"
+                    }
+                }.start()
+            }
         }
     }
 

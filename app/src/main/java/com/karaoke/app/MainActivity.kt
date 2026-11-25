@@ -2,6 +2,9 @@ package com.karaoke.app
 
 import android.Manifest
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -28,8 +31,13 @@ import org.schabi.newpipe.extractor.services.youtube.linkHandler.YoutubeSearchQu
 import org.schabi.newpipe.extractor.stream.StreamInfo
 import org.schabi.newpipe.extractor.stream.StreamInfoItem
 import java.io.File
+import java.io.PrintWriter
+import java.io.StringWriter
 import java.net.URL
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 data class KWord(val start: Long, val text: String)
 data class KLine(val start: Long, val words: List<KWord>)
@@ -47,6 +55,8 @@ class MainActivity : Activity() {
     private var offsetMs = 0L
     private var vocalRemove = true
     private var sessionId = 0
+
+    @Volatile private var lastError = ""
 
     private lateinit var input: EditText
     private lateinit var lyricView: TextView
@@ -69,6 +79,30 @@ class MainActivity : Activity() {
 
     private fun updateVocalBtn() {
         vocalBtn.text = if (vocalRemove) "Vokal silme: AÇIK" else "Vokal silme: KAPALI"
+    }
+
+    // ---------- Hata kaydı ----------
+    private fun logError(where: String, e: Throwable) {
+        try {
+            val sw = StringWriter()
+            e.printStackTrace(PrintWriter(sw))
+            val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+            val entry = "[$time] $where\n" +
+                "Cihaz: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.SDK_INT}\n" +
+                "${e.javaClass.name}: ${e.message}\n" +
+                sw.toString().take(3500) + "\n\n"
+            lastError = (lastError + entry).takeLast(7000)
+            File(getExternalFilesDir(null), "hata.txt").writeText(lastError)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun copyError() {
+        val text = if (lastError.isBlank()) "Hata kaydı yok." else lastError
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("hata", text))
+        status.text = if (lastError.isBlank()) "Henüz hata yok."
+        else "Hata kaydı kopyalandı. Bana yapıştır."
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -131,6 +165,7 @@ class MainActivity : Activity() {
         root.addView(btn("BAŞLA") { onStartClicked() })
         root.addView(btn("DURDUR") { stopSession() })
         root.addView(btn("Kaydı dinle") { playRecording() })
+        root.addView(btn("HATA KAYDINI KOPYALA") { copyError() })
         root.addView(offsetRow)
         root.addView(lyricView, LinearLayout.LayoutParams(-1, 0, 1f))
         root.addView(nextView)
@@ -153,19 +188,33 @@ class MainActivity : Activity() {
                 )
                 val ex = service.getSearchExtractor(qh)
                 ex.fetchPage()
-                val item = ex.initialPage.items
+                val items = ex.initialPage.items
                     .filterIsInstance<StreamInfoItem>()
-                    .firstOrNull() ?: throw Exception("Sonuç bulunamadı")
+                    .take(3)
+                if (items.isEmpty()) throw Exception("Sonuç bulunamadı")
 
-                val info = StreamInfo.getInfo(service, item.url)
-                val audio = info.audioStreams
-                    .filter { it.format == MediaFormat.M4A }
-                    .maxByOrNull { it.averageBitrate }
-                    ?: info.audioStreams.firstOrNull()
-                    ?: throw Exception("Ses akışı yok")
+                var found: Pair<String, String>? = null
+                var lastEx: Throwable? = null
+                for (item in items) {
+                    try {
+                        val info = StreamInfo.getInfo(service, item.url)
+                        val audio = info.audioStreams
+                            .filter { it.format == MediaFormat.M4A }
+                            .maxByOrNull { it.averageBitrate }
+                            ?: info.audioStreams.firstOrNull()
+                            ?: throw Exception("Ses akışı yok")
+                        found = Pair(item.name, audio.content)
+                        break
+                    } catch (e: Exception) {
+                        lastEx = e
+                        logError("video denemesi: ${item.url}", e)
+                    }
+                }
+                if (found == null) throw (lastEx ?: Exception("Ses akışı yok"))
 
-                val url = audio.content
-                runOnUiThread { status.text = "Müzik bulundu: ${item.name}\nSözler aranıyor..." }
+                val title = found.first
+                val url = found.second
+                runOnUiThread { status.text = "Müzik bulundu: $title\nSözler aranıyor..." }
 
                 val lrc = fetchLyrics(q)
                 runOnUiThread {
@@ -174,14 +223,18 @@ class MainActivity : Activity() {
                     updateVocalBtn()
                     if (lrc != null) {
                         lines = parseLrc(lrc)
-                        status.text = "Hazır: ${item.name}\n${lines.size} satır söz. BAŞLA'ya bas."
+                        status.text = "Hazır: $title\n${lines.size} satır söz. BAŞLA'ya bas."
                     } else {
                         lines = emptyList()
-                        status.text = "Hazır: ${item.name}\nSöz bulunamadı (sadece müzik çalar)."
+                        status.text = "Hazır: $title\nSöz bulunamadı (sadece müzik çalar)."
                     }
                 }
             } catch (e: Exception) {
-                runOnUiThread { status.text = "Hata: ${e.message}" }
+                logError("arama: $q", e)
+                runOnUiThread {
+                    status.text = "Hata: ${e.javaClass.simpleName}: ${e.message}\n" +
+                        "('Hata kaydını kopyala' butonuna bas)"
+                }
             }
         }.start()
     }
@@ -190,7 +243,7 @@ class MainActivity : Activity() {
         return try {
             val u = "https://lrclib.net/api/search?q=" + URLEncoder.encode(q, "UTF-8")
             val conn = URL(u).openConnection()
-            conn.setRequestProperty("User-Agent", "KaraokeApp/3.0")
+            conn.setRequestProperty("User-Agent", "KaraokeApp/3.1")
             val txt = conn.getInputStream().bufferedReader().use { it.readText() }
             val arr = JSONArray(txt)
             for (i in 0 until arr.length()) {
@@ -202,6 +255,7 @@ class MainActivity : Activity() {
             }
             null
         } catch (e: Exception) {
+            logError("söz arama", e)
             null
         }
     }
@@ -232,6 +286,7 @@ class MainActivity : Activity() {
                 lines = parseLrc(text)
                 status.text = "${lines.size} satır söz yüklendi."
             } catch (e: Exception) {
+                logError("LRC okuma", e)
                 status.text = "LRC okunamadı: ${e.message}"
             }
         }
@@ -393,8 +448,12 @@ class MainActivity : Activity() {
                     }
                 }
             } catch (e: Exception) {
+                logError("vokal ayırma", e)
                 runOnUiThread {
-                    if (myId == sessionId) status.text = "Vokal ayırma hatası: ${e.message}"
+                    if (myId == sessionId) {
+                        status.text = "Vokal ayırma hatası: ${e.message}\n" +
+                            "('Hata kaydını kopyala' butonuna bas)"
+                    }
                 }
             }
         }.start()
@@ -432,12 +491,14 @@ class MainActivity : Activity() {
                     handler.post(ticker)
                     status.text = "Çalıyor ve kaydediyor... (kulaklık tak)"
                 } catch (e: Exception) {
+                    logError("oynatma başlatma", e)
                     status.text = "Başlatılamadı: ${e.message}"
                     stopSession()
                 }
             }
             p.setOnErrorListener { _, what, extra ->
-                status.text = "Oynatma hatası ($what/$extra)"
+                logError("MediaPlayer", Exception("what=$what extra=$extra"))
+                status.text = "Oynatma hatası ($what/$extra)\n('Hata kaydını kopyala' butonuna bas)"
                 stopSession()
                 true
             }
@@ -446,6 +507,7 @@ class MainActivity : Activity() {
             status.text = "Müzik yükleniyor..."
             p.prepareAsync()
         } catch (e: Exception) {
+            logError("beginPlayback", e)
             status.text = "Hata: ${e.message}"
             stopSession()
         }
@@ -480,6 +542,7 @@ class MainActivity : Activity() {
                 start()
             }
         } catch (e: Exception) {
+            logError("kaydı dinle", e)
             status.text = "Oynatılamadı: ${e.message}"
         }
     }

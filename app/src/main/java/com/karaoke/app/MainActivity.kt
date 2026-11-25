@@ -59,12 +59,14 @@ class MainActivity : Activity() {
     private var offsetMs = 0L
     private var sessionId = 0
 
-    private var stage = 0            // 0 boşta, 1 analiz+sesli çalma, 2 vokalsiz çalma+kayıt
-    private var stage1Active = false
-    private var p1Finished = false
+    private var stage = 0            // 0 bosta, 1 indirme+analiz, 2 vokalsiz calma+kayit
     private var analysis: VocalRemover.Result? = null
     private var instrFile: File? = null
+    private var srcFile: File? = null
+    private var plannedOffset = 0L
     private var syncNote = ""
+    private var videoSec = -1L
+    private var lrcSec = -1.0
 
     private val dbg = StringBuilder()
 
@@ -77,7 +79,7 @@ class MainActivity : Activity() {
     private val BLUE = Color.parseColor("#2196F3")
     private val WHITE = Color.WHITE
 
-    // ---------- günlük / debug ----------
+    // ---------- gunluk / debug ----------
     private fun dlog(msg: String) {
         synchronized(dbg) {
             val t = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
@@ -124,15 +126,16 @@ class MainActivity : Activity() {
         sb.append("Cihaz: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.SDK_INT}\n")
         sb.append("Asama: $stage\n")
         sb.append("Kaynak: ${if (streamUrl != null) "YouTube" else if (audioUri != null) "dosya" else "yok"}\n")
+        sb.append("Video suresi: $videoSec sn, soz suresi: $lrcSec sn\n")
         sb.append("Soz satiri: ${lines.size}, ilk satir: ${lines.firstOrNull()?.start} ms\n")
         val a = analysis
         if (a != null) {
             sb.append("Analiz: ok=${a.ok} ses girisi=${a.onsetMs} ms guven=${"%.1f".format(a.confDb)} dB " +
-                "guvenilir=${a.reliable} sure=${a.durationMs} ms not=${a.note}\n")
+                "guvenilir=${a.reliable} cozulen sure=${a.durationMs} ms not=${a.note}\n")
         } else {
             sb.append("Analiz: yok\n")
         }
-        sb.append("Soz kaydirma (offset): $offsetMs ms\n")
+        sb.append("Planlanan kaydirma: $plannedOffset ms, su anki kaydirma (offset): $offsetMs ms\n")
         sb.append("\n--- Olay gunlugu ---\n")
         synchronized(dbg) { sb.append(dbg) }
 
@@ -166,21 +169,6 @@ class MainActivity : Activity() {
                 updateLyrics()
                 handler.postDelayed(this, 40)
             }
-        }
-    }
-
-    private val ticker1 = object : Runnable {
-        override fun run() {
-            if (!stage1Active) return
-            val a = analysis
-            if (a != null) {
-                val pos = try { player?.currentPosition?.toLong() ?: 0L } catch (_: Exception) { 0L }
-                if (!a.ok || p1Finished || pos >= a.onsetMs) {
-                    startStage2(true)
-                    return
-                }
-            }
-            handler.postDelayed(this, 100)
         }
     }
 
@@ -234,10 +222,15 @@ class MainActivity : Activity() {
             })
             addView(btn("veya: Müzik dosyası seç") { pickFile(1) })
             addView(btn("veya: LRC dosyası seç") { pickFile(2) })
-            addView(btn("BAŞLA 1 (sesli çal + ses girişini bul)") { onStartClicked() })
+            addView(btn("BAŞLA 1 (indir + analiz, sessiz)") { onStartClicked() })
             addView(btn("BAŞLA 2 (vokalsiz müzik + kayıt)") { startStage2(false) })
             addView(btn("DURDUR") { stopSession(); status.text = "Durduruldu." })
             addView(offsetRow)
+            addView(btn("Kaydırmayı sıfırla (0)") {
+                offsetMs = 0
+                dlog("Kaydirma sifirlandi")
+                status.text = "Söz kaydırma: 0 sn"
+            })
             addView(btn("SENKRON: sıradaki satır ŞİMDİ başlıyor") { syncToNow() })
             addView(btn("Kaydı dinle") { playRecording() })
             addView(btn("DEBUG KAYDET (İndirilenler)") { saveDebug() })
@@ -287,6 +280,7 @@ class MainActivity : Activity() {
         status.text = "Aranıyor..."
         streamUrl = null
         audioUri = null
+        srcFile = null
         analysis = null
         offsetMs = 0
         Thread {
@@ -325,13 +319,15 @@ class MainActivity : Activity() {
 
                 val title = found.first
                 val url = found.second
-                val videoSec = found.third
-                dlog("Video: $title (${videoSec} sn)")
+                val vSec = found.third
+                dlog("Video: $title ($vSec sn)")
                 runOnUiThread { status.text = "Şarkı bulundu: $title\nSözler aranıyor..." }
 
-                val lrc = fetchLyrics(q, videoSec)
+                val lrc = fetchLyrics(q, vSec)
                 runOnUiThread {
                     streamUrl = url
+                    videoSec = vSec
+                    lrcSec = lrc?.second ?: -1.0
                     if (lrc != null) {
                         lines = parseLrc(lrc.first)
                         dlog("Soz: ${lines.size} satir, sure=${lrc.second} sn")
@@ -356,7 +352,7 @@ class MainActivity : Activity() {
         return try {
             val u = "https://lrclib.net/api/search?q=" + URLEncoder.encode(q, "UTF-8")
             val conn = URL(u).openConnection()
-            conn.setRequestProperty("User-Agent", "KaraokeApp/4.0")
+            conn.setRequestProperty("User-Agent", "KaraokeApp/5.0")
             val txt = conn.getInputStream().bufferedReader().use { it.readText() }
             val arr = JSONArray(txt)
             var best: Pair<String, Double>? = null
@@ -396,8 +392,11 @@ class MainActivity : Activity() {
         if (requestCode == 1) {
             audioUri = uri
             streamUrl = null
+            srcFile = null
             analysis = null
             offsetMs = 0
+            videoSec = -1
+            lrcSec = -1.0
             status.text = "Müzik dosyası seçildi. BAŞLA 1'e bas."
         } else if (requestCode == 2) {
             try {
@@ -550,8 +549,11 @@ class MainActivity : Activity() {
 
     private fun setSource(p: MediaPlayer, processed: File?) {
         val url = streamUrl
+        val sf = srcFile
         if (processed != null) {
             p.setDataSource(processed.absolutePath)
+        } else if (sf != null && sf.exists() && sf.length() > 0) {
+            p.setDataSource(sf.absolutePath)
         } else if (url != null) {
             p.setDataSource(this, Uri.parse(url), mapOf("User-Agent" to DownloaderImpl.USER_AGENT))
         } else {
@@ -563,58 +565,96 @@ class MainActivity : Activity() {
         stopSession()
         val myId = ++sessionId
         stage = 1
-        stage1Active = true
-        p1Finished = false
         analysis = null
         instrFile = null
+        srcFile = null
         offsetMs = 0
-        val hint = lines.firstOrNull()?.start ?: 0L
-        dlog("BASLA1: hint(ilk soz satiri)=$hint ms")
-        status.text = "Başlat 1: şarkı çalıyor, sesin girdiği an aranıyor..."
+        plannedOffset = 0
+        lyricView.text = ""
+        nextView.text = ""
 
-        try {
-            val p = MediaPlayer()
-            setSource(p, null)
-            p.setOnPreparedListener { it.start() }
-            p.setOnCompletionListener { p1Finished = true }
-            p.setOnErrorListener { _, what, extra ->
-                dlog("Asama1 MediaPlayer hata $what/$extra")
-                p1Finished = true
-                true
-            }
-            player = p
-            p.prepareAsync()
-        } catch (e: Exception) {
-            logError("asama1 calma", e)
-            p1Finished = true
-        }
-        handler.post(ticker1)
+        val first = lines.firstOrNull()?.start ?: -1L
+        val url = streamUrl
+        val uri = audioUri
+        val vSec = videoSec
+        val lSec = lrcSec
+        dlog("BASLA1: ilkSoz=$first ms, video=$vSec sn, soz suresi=$lSec sn")
+        status.text = "Başlat 1: hazırlanıyor..."
 
         Thread {
             try {
-                val outFile = File(cacheDir, "instrumental.wav")
-                val res = VocalRemover.process(this, streamUrl, audioUri, outFile, hint) { pct ->
-                    runOnUiThread {
-                        if (myId == sessionId && stage == 1) {
-                            status.text = "Başlat 1: analiz %$pct"
+                var src: File? = null
+                if (url != null) {
+                    val f = File(cacheDir, "source_audio.m4a")
+                    val t0 = System.currentTimeMillis()
+                    val note = AudioFetcher.download(url, f) { pct ->
+                        runOnUiThread {
+                            if (myId == sessionId) status.text = "Başlat 1: şarkı indiriliyor %$pct"
                         }
                     }
+                    dlog("Indirme: $note, ${System.currentTimeMillis() - t0} ms")
+                    src = f
                 }
+                if (myId != sessionId) return@Thread
+
+                val durMatch = lSec > 0 && vSec > 0 && Math.abs(vSec - lSec) <= 3.0
+                val detect = first >= 0 && !durMatch
+                val lo = if (detect) Math.max(0L, first - 15000L) else 0L
+                val hi = if (detect) first + 15000L else 0L
+                dlog("Analiz basliyor: sureEslesti=$durMatch tespit=$detect aralik=$lo..$hi")
+
+                val t1 = System.currentTimeMillis()
+                val outFile = File(cacheDir, "instrumental.wav")
+                val res = VocalRemover.process(
+                    this, src, uri, outFile, lo, hi, { myId != sessionId }
+                ) { pct ->
+                    runOnUiThread {
+                        if (myId == sessionId) status.text = "Başlat 1: analiz %$pct"
+                    }
+                }
+                dlog("Analiz ${System.currentTimeMillis() - t1} ms surdu")
+                if (myId != sessionId) return@Thread
+
+                val planned = when {
+                    first < 0 -> 0L
+                    durMatch -> 0L
+                    res.reliable && res.onsetMs >= 0 -> res.onsetMs - first
+                    else -> 0L
+                }
+
+                val sn = StringBuilder()
+                if (first >= 0) {
+                    if (durMatch) {
+                        sn.append("\nSüre eşleşti (video $vSec sn, söz ${lSec.toInt()} sn): söz zamanı doğrudan kullanılıyor.")
+                    } else if (res.reliable) {
+                        sn.append("\nSes girişi ${"%.1f".format(res.onsetMs / 1000.0)} sn bulundu, " +
+                            "kaydırma ${"%.1f".format(planned / 1000.0)} sn.")
+                    } else {
+                        sn.append("\n⚠ Senkron emin değil, kaydırma 0. Kayıyorsa -/+ ile düzelt, sonra DEBUG KAYDET.")
+                    }
+                }
+                if (vSec > 0 && res.ok && res.durationMs < vSec * 1000 - 4000) {
+                    sn.append("\n⚠ Ses ${res.durationMs / 1000} sn, video $vSec sn: şarkı eksik inmiş olabilir.")
+                }
+                if (!res.ok) sn.append("\n(Vokal silinemedi: ${res.note})")
+
                 runOnUiThread {
                     if (myId != sessionId) return@runOnUiThread
+                    srcFile = src
                     analysis = res
                     instrFile = if (res.ok) outFile else null
+                    plannedOffset = planned
+                    syncNote = sn.toString()
                     dlog("Analiz bitti: ok=${res.ok} onset=${res.onsetMs} guven=${res.confDb} " +
-                        "guvenilir=${res.reliable} sure=${res.durationMs} not=${res.note}")
-                    status.text = "Ses girişi: ${"%.1f".format(res.onsetMs / 1000.0)} sn " +
-                        "(güven ${"%.1f".format(res.confDb)} dB)\nBu ana gelince BAŞLA 2 otomatik başlayacak."
+                        "guvenilir=${res.reliable} cozulen=${res.durationMs} ms not=${res.note} planlanan=$planned")
+                    startStage2(true)
                 }
             } catch (e: Exception) {
-                logError("analiz", e)
+                logError("asama1", e)
                 runOnUiThread {
                     if (myId == sessionId) {
-                        analysis = VocalRemover.Result(false, hint, 0f, false, 0, "hata: ${e.message}")
-                        status.text = "Analiz hatası: ${e.message}\n('DEBUG KAYDET' butonuna bas)"
+                        stage = 0
+                        status.text = "Hata: ${e.javaClass.simpleName}: ${e.message}\n('DEBUG KAYDET' butonuna bas)"
                     }
                 }
             }
@@ -632,22 +672,10 @@ class MainActivity : Activity() {
             status.text = "Mikrofon izni gerekli. BAŞLA 1'e bas."
             return
         }
-        stopSession() // aşama 1'i kapatır, analizi silmez
+        stopSession()
         stage = 2
-
-        val first = lines.firstOrNull()?.start
-        offsetMs = if (first != null) a.onsetMs - first else 0L
-        dlog("BASLA2 (${if (auto) "otomatik" else "elle"}): onset=${a.onsetMs} ilkSoz=$first offset=$offsetMs " +
-            "guvenilir=${a.reliable} vokalsiz=${instrFile != null}")
-
-        syncNote = ""
-        if (!a.reliable) {
-            syncNote = "\n⚠ Senkron emin değil (güven ${"%.1f".format(a.confDb)} dB). " +
-                "Kayıyorsa -/+ ile düzelt, sonra DEBUG KAYDET."
-        }
-        if (!a.ok) {
-            syncNote += "\n(Vokal silinemedi: orijinal çalıyor)"
-        }
+        offsetMs = plannedOffset
+        dlog("BASLA2 (${if (auto) "otomatik" else "elle"}): offset=$offsetMs vokalsiz=${instrFile != null}")
         beginPlayback(instrFile)
     }
 
@@ -701,10 +729,8 @@ class MainActivity : Activity() {
     private fun stopSession() {
         sessionId++
         running = false
-        stage1Active = false
         stage = 0
         handler.removeCallbacks(ticker)
-        handler.removeCallbacks(ticker1)
         val hadRecorder = recorder != null
         try { recorder?.stop() } catch (_: Exception) {}
         try { recorder?.release() } catch (_: Exception) {}

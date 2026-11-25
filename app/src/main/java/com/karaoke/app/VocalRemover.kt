@@ -17,29 +17,34 @@ import kotlin.math.min
 object VocalRemover {
 
     class Result(
-        val ok: Boolean,        // stereo idi ve vokalsiz dosya üretildi
-        val onsetMs: Long,      // sesin (vokalin) girdiği an
-        val confDb: Float,      // algılama güveni (dB)
-        val reliable: Boolean,  // güvenilir mi
-        val durationMs: Long,
+        val ok: Boolean,        // stereo idi ve vokalsiz dosya uretildi
+        val onsetMs: Long,      // ses girisi (-1: aranmadi / bulunamadi)
+        val confDb: Float,      // algilama guveni (dB)
+        val reliable: Boolean,  // guvenilir mi
+        val durationMs: Long,   // cozulen ses suresi
         val note: String
     )
 
+    /**
+     * src veya uri'den okur. detectHiMs <= 0 ise ses girisi aranmaz (sadece vokal silinir).
+     * Aranirsa [detectLoMs, detectHiMs] araliginda aranir.
+     */
     fun process(
         ctx: Context,
-        url: String?,
+        src: File?,
         uri: Uri?,
         out: File,
-        hintMs: Long,
+        detectLoMs: Long,
+        detectHiMs: Long,
+        cancel: () -> Boolean,
         onProgress: (Int) -> Unit
     ): Result {
-        val hint = max(hintMs, 0L)
         val ex = MediaExtractor()
         var codec: MediaCodec? = null
         var raf: RandomAccessFile? = null
         try {
-            if (url != null) {
-                ex.setDataSource(url, mapOf("User-Agent" to DownloaderImpl.USER_AGENT))
+            if (src != null) {
+                ex.setDataSource(src.absolutePath)
             } else {
                 ex.setDataSource(ctx, uri!!, null)
             }
@@ -52,10 +57,10 @@ object VocalRemover {
                     track = i; fmt = f; break
                 }
             }
-            if (track < 0 || fmt == null) return Result(false, hint, 0f, false, 0, "ses izi yok")
+            if (track < 0 || fmt == null) return Result(false, -1, 0f, false, 0, "ses izi yok")
 
             val channels = fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-            if (channels != 2) return Result(false, hint, 0f, false, 0, "stereo degil ($channels kanal)")
+            if (channels != 2) return Result(false, -1, 0f, false, 0, "stereo degil ($channels kanal)")
             var sampleRate = fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE)
             val durationUs =
                 if (fmt.containsKey(MediaFormat.KEY_DURATION)) fmt.getLong(MediaFormat.KEY_DURATION) else 0L
@@ -69,7 +74,7 @@ object VocalRemover {
             if (out.exists()) out.delete()
             val file = RandomAccessFile(out, "rw")
             raf = file
-            file.write(ByteArray(44)) // başlık sonra yazılacak
+            file.write(ByteArray(44)) // baslik sonra yazilacak
 
             val info = MediaCodec.BufferInfo()
             var inputDone = false
@@ -79,7 +84,7 @@ object VocalRemover {
             var alpha = (1.0 - exp(-2.0 * Math.PI * 150.0 / sampleRate)).toFloat()
             var lastPct = -1
 
-            // --- ses girişi analizi (orta kanal / yan kanal oranı, 300-3400 Hz) ---
+            // --- ses girisi analizi (orta kanal / yan kanal orani, 300-3400 Hz) ---
             var aA = (1.0 - exp(-2.0 * Math.PI * 300.0 / sampleRate)).toFloat()
             var aB = (1.0 - exp(-2.0 * Math.PI * 3400.0 / sampleRate)).toFloat()
             var mA = 0f; var mB = 0f; var sA = 0f; var sB = 0f
@@ -90,6 +95,8 @@ object VocalRemover {
             val loud = ArrayList<Float>()
 
             while (!outputDone) {
+                if (cancel()) return Result(false, -1, 0f, false, 0, "iptal")
+
                 if (!inputDone) {
                     val inIdx = c.dequeueInputBuffer(10000)
                     if (inIdx >= 0) {
@@ -122,7 +129,7 @@ object VocalRemover {
                             val mid = (l + r) / 2f
                             val side = (l - r) / 2f
 
-                            // vokalsiz çıkış
+                            // vokalsiz cikis
                             lp += alpha * (mid - lp)
                             var o = side + lp
                             if (o > 32767f) o = 32767f
@@ -168,7 +175,7 @@ object VocalRemover {
                 }
             }
 
-            // WAV başlığı (her zaman 2 kanal, 16 bit)
+            // WAV basligi (her zaman 2 kanal, 16 bit)
             val h = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
             h.put("RIFF".toByteArray())
             h.putInt((36 + dataBytes).toInt())
@@ -188,9 +195,11 @@ object VocalRemover {
 
             val durMs = if (sampleRate > 0) frames * 1000L / sampleRate else 0L
 
-            // ---------- ses girişini bul ----------
+            if (detectHiMs <= 0) return Result(true, -1, 0f, false, durMs, "tespit yapilmadi")
+
+            // ---------- ses girisini bul ----------
             val n = ratio.size
-            if (n < 60) return Result(true, hint, 0f, false, durMs, "sarki cok kisa")
+            if (n < 60) return Result(true, -1, 0f, false, durMs, "sarki cok kisa")
 
             val sm = FloatArray(n) { idx ->
                 var a = 0f
@@ -202,9 +211,10 @@ object VocalRemover {
                 a / cnt
             }
 
-            val hintBin = (hint / 100).toInt()
-            val lo = if (hint > 0) max(3, hintBin - 400) else 3
-            val hi = if (hint > 0) min(n - 10, hintBin + 400) else min(n - 10, 2400)
+            val lo = max(3, (detectLoMs / 100).toInt())
+            val hi = min(n - 10, (detectHiMs / 100).toInt())
+            if (hi <= lo) return Result(true, -1, 0f, false, durMs, "arama araligi gecersiz")
+
             var bestT = -1
             var best = -1e9f
             for (t in lo until hi) {
@@ -219,11 +229,10 @@ object VocalRemover {
                 if (score > best) { best = score; bestT = t }
             }
 
-            if (bestT < 0) return Result(true, hint, 0f, false, durMs, "ses girisi bulunamadi")
-            val reliable = best >= 3f
-            val onset = if (reliable) bestT * 100L else hint
-            val note = if (reliable) "ses girisi bulundu" else "guven dusuk, soz zamani varsayildi"
-            return Result(true, onset, best, reliable, durMs, note)
+            if (bestT < 0) return Result(true, -1, 0f, false, durMs, "ses girisi bulunamadi")
+            val reliable = best >= 5f
+            val note = if (reliable) "ses girisi bulundu" else "guven dusuk"
+            return Result(true, bestT * 100L, best, reliable, durMs, note)
         } finally {
             try { codec?.stop() } catch (_: Exception) {}
             try { codec?.release() } catch (_: Exception) {}

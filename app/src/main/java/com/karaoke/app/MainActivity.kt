@@ -45,11 +45,14 @@ class MainActivity : Activity() {
     private var recFile: File? = null
     private var running = false
     private var offsetMs = 0L
+    private var vocalRemove = true
+    private var sessionId = 0
 
     private lateinit var input: EditText
     private lateinit var lyricView: TextView
     private lateinit var nextView: TextView
     private lateinit var status: TextView
+    private lateinit var vocalBtn: Button
     private val handler = Handler(Looper.getMainLooper())
 
     private val BLUE = Color.parseColor("#2196F3")
@@ -62,6 +65,10 @@ class MainActivity : Activity() {
                 handler.postDelayed(this, 40)
             }
         }
+    }
+
+    private fun updateVocalBtn() {
+        vocalBtn.text = if (vocalRemove) "Vokal silme: AÇIK" else "Vokal silme: KAPALI"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -98,6 +105,12 @@ class MainActivity : Activity() {
             setOnClickListener { onClick() }
         }
 
+        vocalBtn = btn("") {
+            vocalRemove = !vocalRemove
+            updateVocalBtn()
+        }
+        updateVocalBtn()
+
         val offsetRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(btn("Söz -0.5s") { offsetMs -= 500; status.text = "Kaydırma: ${offsetMs} ms" },
@@ -114,6 +127,7 @@ class MainActivity : Activity() {
         })
         root.addView(btn("veya: Müzik dosyası seç") { pickFile(1) })
         root.addView(btn("veya: LRC dosyası seç") { pickFile(2) })
+        root.addView(vocalBtn)
         root.addView(btn("BAŞLA") { onStartClicked() })
         root.addView(btn("DURDUR") { stopSession() })
         root.addView(btn("Kaydı dinle") { playRecording() })
@@ -156,6 +170,8 @@ class MainActivity : Activity() {
                 val lrc = fetchLyrics(q)
                 runOnUiThread {
                     streamUrl = url
+                    vocalRemove = false // karaoke videosu zaten vokalsiz
+                    updateVocalBtn()
                     if (lrc != null) {
                         lines = parseLrc(lrc)
                         status.text = "Hazır: ${item.name}\n${lines.size} satır söz. BAŞLA'ya bas."
@@ -174,7 +190,7 @@ class MainActivity : Activity() {
         return try {
             val u = "https://lrclib.net/api/search?q=" + URLEncoder.encode(q, "UTF-8")
             val conn = URL(u).openConnection()
-            conn.setRequestProperty("User-Agent", "KaraokeApp/2.0")
+            conn.setRequestProperty("User-Agent", "KaraokeApp/3.0")
             val txt = conn.getInputStream().bufferedReader().use { it.readText() }
             val arr = JSONArray(txt)
             for (i in 0 until arr.length()) {
@@ -190,7 +206,7 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------- Dosya seçme (yedek yöntem) ----------
+    // ---------- Dosya seçme ----------
     private fun pickFile(code: Int) {
         val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
@@ -206,7 +222,9 @@ class MainActivity : Activity() {
         if (requestCode == 1) {
             audioUri = uri
             streamUrl = null
-            status.text = "Müzik dosyası seçildi."
+            vocalRemove = true
+            updateVocalBtn()
+            status.text = "Müzik dosyası seçildi. Vokal silme AÇIK."
         } else if (requestCode == 2) {
             try {
                 val text = contentResolver.openInputStream(uri)!!
@@ -349,6 +367,40 @@ class MainActivity : Activity() {
 
     private fun startSession() {
         stopSession()
+        val myId = ++sessionId
+
+        if (!vocalRemove) {
+            beginPlayback(null)
+            return
+        }
+
+        status.text = "Vokal ayrılıyor... %0"
+        Thread {
+            try {
+                val outFile = File(cacheDir, "instrumental.wav")
+                val ok = VocalRemover.process(this, streamUrl, audioUri, outFile) { pct ->
+                    runOnUiThread {
+                        if (myId == sessionId) status.text = "Vokal ayrılıyor... %$pct"
+                    }
+                }
+                runOnUiThread {
+                    if (myId != sessionId) return@runOnUiThread
+                    if (ok) {
+                        beginPlayback(outFile)
+                    } else {
+                        status.text = "Bu şarkı stereo değil, vokal silinemedi. Orijinal çalınıyor."
+                        beginPlayback(null)
+                    }
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    if (myId == sessionId) status.text = "Vokal ayırma hatası: ${e.message}"
+                }
+            }
+        }.start()
+    }
+
+    private fun beginPlayback(processed: File?) {
         try {
             val f = File(getExternalFilesDir(null), "kayit_${System.currentTimeMillis()}.m4a")
             recFile = f
@@ -365,7 +417,9 @@ class MainActivity : Activity() {
 
             val p = MediaPlayer()
             val url = streamUrl
-            if (url != null) {
+            if (processed != null) {
+                p.setDataSource(processed.absolutePath)
+            } else if (url != null) {
                 p.setDataSource(this, Uri.parse(url), mapOf("User-Agent" to DownloaderImpl.USER_AGENT))
             } else {
                 p.setDataSource(this, audioUri!!)
@@ -398,6 +452,7 @@ class MainActivity : Activity() {
     }
 
     private fun stopSession() {
+        sessionId++
         running = false
         handler.removeCallbacks(ticker)
         try { recorder?.stop() } catch (_: Exception) {}

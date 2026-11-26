@@ -3,7 +3,6 @@ package com.karaoke.app
 import android.app.Activity
 import android.content.Context
 import android.graphics.Color
-import android.media.MediaPlayer
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.SeekBar
@@ -13,25 +12,30 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-/** Ses efektleri bolumu: mod secimi, onizleme, kaydetme. */
+/** Ses efektleri bolumu: mod secimi, oynatici acma, kaydetme. */
 class FxPanel(
     private val act: Activity,
     private val getRec: () -> File?,
     private val getInstr: () -> File?,
     private val getMusicVol: () -> Float,
+    private val isRecording: () -> Boolean,
     private val say: (String) -> Unit,
     private val log: (String) -> Unit,
-    private val saveDl: (File, String, String) -> Boolean
+    private val saveDl: (File, String, String) -> Boolean,
+    private val keepAlive: (String) -> Unit,
+    private val closePlayer: () -> Unit,
+    private val onMix: (File, Boolean) -> Unit
 ) {
     private val prefs = act.getSharedPreferences("karaoke_fx", Context.MODE_PRIVATE)
     private var mode = prefs.getInt("mode", 0).coerceIn(0, VoiceFx.MODES.size - 1)
     private var voiceLevel = prefs.getInt("voice", 100).coerceIn(0, 200)
     private var shiftMs = prefs.getInt("shift", -120)
-    private var preview: MediaPlayer? = null
     private val modeBtns = ArrayList<Button>()
     private lateinit var shiftLabel: TextView
     private lateinit var voiceLabel: TextView
     @Volatile private var busy = false
+
+    fun isBusy(): Boolean = busy
 
     private fun refreshModes() {
         for (i in modeBtns.indices) {
@@ -54,7 +58,7 @@ class FxPanel(
             setPadding(0, 16, 0, 4)
         })
         root.addView(TextView(act).apply {
-            text = "Kayıt yaptıktan sonra mod seç, ÖNİZLE ile müzikle birlikte dinle, beğenirsen KAYDET."
+            text = "Kayıt yaptıktan sonra mod seç, ÖNİZLE ile müzikle birlikte dinle (ekranda oynatıcı açılır), beğenirsen KAYDET."
             setTextColor(Color.GRAY); textSize = 12f
         })
 
@@ -122,38 +126,19 @@ class FxPanel(
         root.addView(shiftRow)
 
         root.addView(Button(act).apply {
-            text = "ÖNİZLE (efektli karışımı dinle)"
-            setOnClickListener { run(play = true, save = false) }
-        })
-        root.addView(Button(act).apply {
-            text = "Önizlemeyi durdur"
-            setOnClickListener { stopPreview() }
+            text = "ÖNİZLE (müzikle birlikte, oynatıcı açılır)"
+            setOnClickListener { run(play = true, save = false, autoStart = true) }
         })
         root.addView(Button(act).apply {
             text = "EFEKTLİ KAYDI KAYDET (İndirilenler)"
-            setOnClickListener { run(play = false, save = true) }
+            setOnClickListener { run(play = false, save = true, autoStart = false) }
         })
         return root
     }
 
-    private fun stopPreview() {
-        try { preview?.stop() } catch (_: Exception) {}
-        try { preview?.release() } catch (_: Exception) {}
-        preview = null
-    }
-
-    private fun startPreview(f: File) {
-        try {
-            stopPreview()
-            preview = MediaPlayer().apply {
-                setDataSource(f.absolutePath)
-                prepare()
-                start()
-            }
-        } catch (e: Exception) {
-            log("HATA onizleme: ${e.message}")
-            say("Önizleme çalınamadı: ${e.message}")
-        }
+    /** Kaydi secili efektle muzikle karistirip ekrandaki oynaticida acar. */
+    fun playMix(autoStart: Boolean) {
+        run(play = true, save = false, autoStart = autoStart)
     }
 
     private fun latestRecording(): File? {
@@ -162,7 +147,11 @@ class FxPanel(
             ?.maxByOrNull { it.lastModified() }
     }
 
-    private fun run(play: Boolean, save: Boolean) {
+    private fun run(play: Boolean, save: Boolean, autoStart: Boolean) {
+        if (isRecording()) {
+            say("Kayıt sürüyor. Önce DURDUR'a bas.")
+            return
+        }
         val rec = getRec()?.takeIf { it.exists() && it.length() > 1000 } ?: latestRecording()
         if (rec == null) {
             say("Önce bir kayıt yap (BAŞLA 2 çalışırken söyle, sonra DURDUR).")
@@ -173,7 +162,8 @@ class FxPanel(
             return
         }
         busy = true
-        stopPreview()
+        closePlayer()
+        keepAlive("Efekt uygulanıyor...")
         val m = mode
         val vl = voiceLevel / 100f
         val sh = shiftMs
@@ -190,8 +180,8 @@ class FxPanel(
                 log("Efekt: mod=${VoiceFx.MODES[m]} ses=%${(vl * 100).toInt()} muzik=%${(mv * 100).toInt()} $note")
                 if (play) {
                     act.runOnUiThread {
-                        say("Önizleme çalıyor: ${VoiceFx.MODES[m]}")
-                        startPreview(out)
+                        say("Oynatıcı açıldı (${VoiceFx.MODES[m]}). Çubuğa dokunup istediğin yere git.")
+                        onMix(out, autoStart)
                     }
                 }
                 if (save) saveOut(out, m)

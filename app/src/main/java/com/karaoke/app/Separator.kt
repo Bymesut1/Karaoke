@@ -237,10 +237,28 @@ object Separator {
         return o
     }
 
-    private fun runModel(env: OrtEnvironment, sess: OrtSession, name: String, input: FloatArray, out: FloatArray) {
-        val tensor = OnnxTensor.createTensor(
-            env, FloatBuffer.wrap(input), longArrayOf(1, 2, T.toLong(), F.toLong())
-        )
+    /**
+     * Modelin istedigi giris sekline gore tensor sekli secer.
+     * Veri dizilimi her iki durumda da ayni: [kanal][kare][bin].
+     *  - (batch, kanal=2, 512, 1024) -> 1x2x512x1024
+     *  - (kanal=2, parca, 512, 1024) -> 2x1x512x1024
+     */
+    private fun feedShape(sess: OrtSession, name: String): LongArray {
+        val s = (sess.inputInfo[name]!!.info as TensorInfo).shape
+        val str = s.joinToString("x")
+        if (s.size != 4) throw Exception("Beklenmeyen model girisi: $str")
+        val okTF = (s[2] == -1L || s[2] == T.toLong()) && (s[3] == -1L || s[3] == F.toLong())
+        if (!okTF) throw Exception("Beklenmeyen model girisi: $str")
+        if (s[1] == 2L) return longArrayOf(1, 2, T.toLong(), F.toLong())
+        if (s[0] == 2L) return longArrayOf(2, 1, T.toLong(), F.toLong())
+        throw Exception("Beklenmeyen model girisi: $str")
+    }
+
+    private fun runModel(
+        env: OrtEnvironment, sess: OrtSession, name: String, shape: LongArray,
+        input: FloatArray, out: FloatArray
+    ) {
+        val tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(input), shape)
         try {
             sess.run(mapOf(name to tensor)).use { res ->
                 val o = res.get(0) as OnnxTensor
@@ -306,14 +324,10 @@ object Separator {
         try {
             val nameV = sv.inputNames.iterator().next()
             val nameA = sa.inputNames.iterator().next()
-            val shapeArr = (sv.inputInfo[nameV]!!.info as TensorInfo).shape
-            val shapeStr = shapeArr.joinToString("x")
-            if (shapeArr.size != 4 || (shapeArr[1] != 2L) ||
-                (shapeArr[2] != -1L && shapeArr[2] != T.toLong()) ||
-                (shapeArr[3] != -1L && shapeArr[3] != F.toLong())
-            ) {
-                throw Exception("Beklenmeyen model girisi: $shapeStr (beklenen ?x2x512x1024)")
-            }
+            val rawShapeStr = (sv.inputInfo[nameV]!!.info as TensorInfo).shape.joinToString("x")
+            val shapeV = feedShape(sv, nameV)
+            val shapeA = feedShape(sa, nameA)
+            val shapeStr = rawShapeStr + "->" + shapeV.joinToString("x")
 
             val frames = nSamples / HOP + 1
             val nSplits = (frames + T - 1) / T
@@ -383,8 +397,8 @@ object Separator {
                 }
 
                 // --- Model ---
-                runModel(env, sv, nameV, inp, outV)
-                runModel(env, sa, nameA, inp, outA)
+                runModel(env, sv, nameV, shapeV, inp, outV)
+                runModel(env, sa, nameA, shapeA, inp, outA)
 
                 // --- Maske + ters STFT ---
                 for (t in 0 until fh) {

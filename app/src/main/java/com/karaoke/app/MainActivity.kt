@@ -26,6 +26,7 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import org.json.JSONArray
 import org.schabi.newpipe.extractor.MediaFormat
@@ -69,12 +70,17 @@ class MainActivity : Activity() {
     private var lrcSec = -1.0
     private var songKey = ""
 
+    private var musicVol = 0.5f      // muzik sesi (0..1)
+    private var strength = 2         // vokal bastirma gucu (1..3)
+
     private val dbg = StringBuilder()
 
     private lateinit var input: EditText
     private lateinit var lyricView: TextView
     private lateinit var nextView: TextView
     private lateinit var status: TextView
+    private lateinit var volLabel: TextView
+    private lateinit var strengthBtn: Button
     private val handler = Handler(Looper.getMainLooper())
 
     private val BLUE = Color.parseColor("#2196F3")
@@ -128,6 +134,7 @@ class MainActivity : Activity() {
         sb.append("Asama: $stage\n")
         sb.append("Kaynak: ${if (streamUrl != null) "YouTube" else if (audioUri != null) "dosya" else "yok"}\n")
         sb.append("Video suresi: $videoSec sn, soz suresi: $lrcSec sn\n")
+        sb.append("Muzik sesi: ${(musicVol * 100).toInt()}%, vokal bastirma gucu: $strength\n")
         sb.append("Soz satiri: ${lines.size}, ilk satir: ${lines.firstOrNull()?.start} ms\n")
         val md = File(filesDir, "models")
         sb.append("Model dosyalari: ").append(
@@ -177,9 +184,18 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun updateStrengthBtn() {
+        val name = when (strength) { 1 -> "hafif"; 3 -> "güçlü"; else -> "orta" }
+        strengthBtn.text = "Vokal bastırma gücü: $strength ($name) – değiştirmek için dokun"
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         NewPipe.init(DownloaderImpl())
+
+        val prefs = getSharedPreferences("karaoke", MODE_PRIVATE)
+        musicVol = prefs.getFloat("vol", 0.5f)
+        strength = prefs.getInt("strength", 2).coerceIn(1, 3)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -211,6 +227,38 @@ class MainActivity : Activity() {
             setOnClickListener { onClick() }
         }
 
+        // --- muzik sesi ---
+        volLabel = TextView(this).apply {
+            setTextColor(Color.LTGRAY); textSize = 13f
+            text = "Müzik sesi: %${(musicVol * 100).toInt()}"
+        }
+        val volBar = SeekBar(this).apply {
+            max = 100
+            progress = (musicVol * 100).toInt()
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                    musicVol = p / 100f
+                    volLabel.text = "Müzik sesi: %$p"
+                    try { player?.setVolume(musicVol, musicVol) } catch (_: Exception) {}
+                }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {
+                    prefs.edit().putFloat("vol", musicVol).apply()
+                    dlog("Muzik sesi: ${(musicVol * 100).toInt()}%")
+                }
+            })
+        }
+
+        // --- vokal bastirma gucu ---
+        strengthBtn = btn("") {
+            strength = if (strength >= 3) 1 else strength + 1
+            prefs.edit().putInt("strength", strength).apply()
+            updateStrengthBtn()
+            dlog("Vokal bastirma gucu: $strength")
+            status.text = "Vokal bastırma gücü $strength. Sonraki BAŞLA 1'de uygulanır (şarkı yeniden ayrılır)."
+        }
+        updateStrengthBtn()
+
         val offsetRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(btn("-2s") { shift(-2000) }, LinearLayout.LayoutParams(0, -2, 1f))
@@ -221,6 +269,9 @@ class MainActivity : Activity() {
 
         val controls = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            addView(volLabel)
+            addView(volBar)
+            addView(strengthBtn)
             addView(btn("ARA (YouTube + söz)") {
                 val q = input.text.toString().trim()
                 if (q.isNotEmpty()) searchAndLoad(q)
@@ -393,7 +444,7 @@ class MainActivity : Activity() {
         return try {
             val u = "https://lrclib.net/api/search?q=" + URLEncoder.encode(q, "UTF-8")
             val conn = URL(u).openConnection()
-            conn.setRequestProperty("User-Agent", "KaraokeApp/6.0")
+            conn.setRequestProperty("User-Agent", "KaraokeApp/7.0")
             val txt = conn.getInputStream().bufferedReader().use { it.readText() }
             val arr = JSONArray(txt)
             var best: Pair<String, Double>? = null
@@ -620,8 +671,9 @@ class MainActivity : Activity() {
         val uri = audioUri
         val vSec = videoSec
         val lSec = lrcSec
+        val str = strength
         val keyHex = Integer.toHexString(songKey.hashCode())
-        dlog("BASLA1: ilkSoz=$first ms, video=$vSec sn, soz suresi=$lSec sn, anahtar=$keyHex")
+        dlog("BASLA1: ilkSoz=$first ms, video=$vSec sn, soz suresi=$lSec sn, anahtar=$keyHex, guc=$str")
         status.text = "Başlat 1: hazırlanıyor..."
 
         fun ui(text: String) {
@@ -648,7 +700,7 @@ class MainActivity : Activity() {
                 if (myId != sessionId) return@Thread
 
                 // 2) Vokal ayirma (onbellek -> yapay zeka -> eski yontem)
-                val cached = File(filesDir, "inst_$keyHex.wav")
+                val cached = File(filesDir, "inst_${keyHex}_s$str.wav")
                 var instr: File = cached
                 var res: VocalRemover.Result
                 var usedFallback = false
@@ -664,11 +716,11 @@ class MainActivity : Activity() {
                             ui("Başlat 1: $label %$pct")
                         }
                         if (myId != sessionId) return@Thread
-                        val tmp = File(filesDir, "inst_$keyHex.tmp")
+                        val tmp = File(filesDir, "inst_${keyHex}_s$str.tmp")
                         var lastLabel = ""
                         var lastP = -1
                         res = Separator.process(
-                            this, src, uri, models.first, models.second, tmp,
+                            this, src, uri, models.first, models.second, tmp, str,
                             { myId != sessionId }
                         ) { label, pct ->
                             if (label != lastLabel || pct != lastP) {
@@ -761,7 +813,8 @@ class MainActivity : Activity() {
         stopSession()
         stage = 2
         offsetMs = plannedOffset
-        dlog("BASLA2 (${if (auto) "otomatik" else "elle"}): offset=$offsetMs vokalsiz=${instrFile != null}")
+        dlog("BASLA2 (${if (auto) "otomatik" else "elle"}): offset=$offsetMs vokalsiz=${instrFile != null} " +
+            "muzik sesi=${(musicVol * 100).toInt()}%")
         beginPlayback(instrFile)
     }
 
@@ -782,8 +835,10 @@ class MainActivity : Activity() {
 
             val p = MediaPlayer()
             setSource(p, processed)
+            p.setVolume(musicVol, musicVol)
             p.setOnPreparedListener {
                 try {
+                    it.setVolume(musicVol, musicVol)
                     recorder?.start()
                     it.start()
                     running = true

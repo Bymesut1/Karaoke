@@ -31,9 +31,6 @@ object Separator {
     private const val T = 512
     private const val F = 1024
 
-    /** Maskeyi keskinlestirir: buyuk = daha az vokal sizintisi, muzik biraz incelir. */
-    private const val MASK_POWER = 1.5f
-
     // ---------------- FFT ----------------
     private class Fft {
         private val cosT = FloatArray(NFFT / 2)
@@ -297,6 +294,10 @@ object Separator {
         return Pair(-1L, 0f)
     }
 
+    /**
+     * strength: 1 = hafif, 2 = orta (varsayilan), 3 = guclu.
+     * Yuksek deger = daha az vokal sizintisi, muzik biraz daha ince/boguk.
+     */
     fun process(
         ctx: Context,
         src: File?,
@@ -304,9 +305,13 @@ object Separator {
         vocalsModel: File,
         accModel: File,
         out: File,
+        strength: Int,
         cancel: () -> Boolean,
         onProgress: (String, Int) -> Unit
     ): VocalRemover.Result {
+        val gain = when (strength) { 1 -> 1f; 3 -> 4f; else -> 2f }
+        val power = when (strength) { 1 -> 1.5f; 3 -> 2.5f; else -> 2.0f }
+
         onProgress("Şarkı çözülüyor", 0)
         val pcm0 = decode(ctx, src, uri, cancel, onProgress)
             ?: return VocalRemover.Result(false, -1, 0f, false, 0, "iptal")
@@ -413,11 +418,12 @@ object Separator {
                             val v2 = v * v
                             val a2 = a * a
                             val sum = v2 + a2 + 1e-10f
-                            var m = (a2 + 5e-11f) / sum
                             val vm = (v2 + 5e-11f) / sum
                             val ve = vm * inp[base + k]
                             vE += ve * ve
-                            m = m.pow(MASK_POWER)
+                            // vokal ihtimali olan yerleri 'gain' kadar agirlikla kes
+                            var m = (a2 + 5e-11f) / (a2 + gain * v2 + 1e-10f)
+                            m = m.pow(power)
                             mk[k] = m
                             if (k >= 896) sumHi += m
                         }
@@ -499,7 +505,8 @@ object Separator {
             val (onsetMs, ratio) = findOnset(vEn, frames)
             return VocalRemover.Result(
                 true, onsetMs, ratio, onsetMs >= 0, durMs,
-                "spleeter onnx, girdi=$shapeStr, parca=$nSplits, kaynak ${pcm0.sampleRate} Hz"
+                "spleeter onnx, girdi=$shapeStr, parca=$nSplits, guc=$strength (gain=$gain, power=$power), " +
+                    "kaynak ${pcm0.sampleRate} Hz"
             )
         } finally {
             try { raf?.close() } catch (_: Exception) {}

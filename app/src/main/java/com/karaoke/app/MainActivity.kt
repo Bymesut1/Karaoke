@@ -8,6 +8,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.Color
 import android.media.MediaPlayer
 import android.media.MediaRecorder
@@ -17,11 +18,16 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.MediaStore
+import android.provider.Settings
 import android.text.Spannable
 import android.text.SpannableString
 import android.text.style.ForegroundColorSpan
 import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -51,7 +57,9 @@ class MainActivity : Activity() {
 
     private var player: MediaPlayer? = null
     private var recorder: MediaRecorder? = null
-    private var reviewPlayer: MediaPlayer? = null
+    private var review: MediaPlayer? = null
+    private var reviewReady = false
+    private var dragging = false
     private var audioUri: Uri? = null
     private var streamUrl: String? = null
     private var lines: List<KLine> = emptyList()
@@ -73,6 +81,12 @@ class MainActivity : Activity() {
     private var musicVol = 0.5f      // muzik sesi (0..1)
     private var strength = 2         // vokal bastirma gucu (1..3)
 
+    // arka plan servisi
+    private var svcOn = false
+    private var modelBusy = false
+    @Volatile private var pendingFx = false
+    private var tickCount = 0
+
     private val dbg = StringBuilder()
 
     private lateinit var input: EditText
@@ -82,6 +96,11 @@ class MainActivity : Activity() {
     private lateinit var volLabel: TextView
     private lateinit var strengthBtn: Button
     private lateinit var fx: FxPanel
+    private lateinit var scroll: ScrollView
+    private lateinit var playerBar: LinearLayout
+    private lateinit var seek: SeekBar
+    private lateinit var timeLabel: TextView
+    private lateinit var playBtn: Button
     private val handler = Handler(Looper.getMainLooper())
 
     private val BLUE = Color.parseColor("#2196F3")
@@ -132,7 +151,7 @@ class MainActivity : Activity() {
         sb.append("=== KARAOKE DEBUG ===\n")
         sb.append("Zaman: ").append(SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(now)).append("\n")
         sb.append("Cihaz: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.SDK_INT}\n")
-        sb.append("Asama: $stage\n")
+        sb.append("Asama: $stage, servis=$svcOn\n")
         sb.append("Kaynak: ${if (streamUrl != null) "YouTube" else if (audioUri != null) "dosya" else "yok"}\n")
         sb.append("Video suresi: $videoSec sn, soz suresi: $lrcSec sn\n")
         sb.append("Muzik sesi: ${(musicVol * 100).toInt()}%, vokal bastirma gucu: $strength\n")
@@ -175,19 +194,205 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    // ---------- UI ----------
-    private val ticker = object : Runnable {
-        override fun run() {
-            if (running) {
-                updateLyrics()
-                handler.postDelayed(this, 40)
+    // ---------- arka plan servisi ----------
+    private fun ensureService(text: String) {
+        try {
+            KeepAliveService.start(this, text)
+            svcOn = true
+        } catch (e: Throwable) {
+            logError("servis baslatma", e)
+        }
+    }
+
+    private fun svcText(text: String) {
+        if (svcOn) KeepAliveService.setText(this, text)
+    }
+
+    private fun reviewPlaying(): Boolean {
+        val rp = review
+        return try { rp != null && reviewReady && rp.isPlaying } catch (_: Exception) { false }
+    }
+
+    private fun isBusy(): Boolean {
+        return stage != 0 || running || modelBusy || pendingFx || fx.isBusy() || reviewPlaying()
+    }
+
+    private fun watchdog() {
+        if (svcOn && !isBusy()) {
+            KeepAliveService.stop(this)
+            svcOn = false
+            dlog("Arka plan servisi durduruldu (is yok)")
+        }
+    }
+
+    private fun askBattery() {
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (pm.isIgnoringBatteryOptimizations(packageName)) {
+                status.text = "Pil kısıtlaması zaten kaldırılmış."
+                return
+            }
+            startActivity(
+                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
+            )
+        } catch (e: Exception) {
+            try {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            } catch (e2: Exception) {
+                status.text = "Pil ayarı açılamadı. Telefon Ayarlar → Uygulamalar → Karaoke → Pil → Kısıtlama yok."
             }
         }
+    }
+
+    // ---------- oynatici ----------
+    private fun fmt(ms: Int): String {
+        val s = ms / 1000
+        return "%d:%02d".format(s / 60, s % 60)
+    }
+
+    private fun seekReview(ms: Int) {
+        val rp = review ?: return
+        if (!reviewReady) return
+        try {
+            if (Build.VERSION.SDK_INT >= 26) rp.seekTo(ms.toLong(), MediaPlayer.SEEK_CLOSEST) else rp.seekTo(ms)
+        } catch (_: Exception) {}
+    }
+
+    private fun closePlayer() {
+        try { review?.stop() } catch (_: Exception) {}
+        try { review?.release() } catch (_: Exception) {}
+        review = null
+        reviewReady = false
+        dragging = false
+        if (this::playerBar.isInitialized) playerBar.visibility = View.GONE
+    }
+
+    private fun openPlayer(file: File, autoStart: Boolean) {
+        closePlayer()
+        try {
+            val p = MediaPlayer()
+            p.setWakeMode(applicationContext, PowerManager.PARTIAL_WAKE_LOCK)
+            p.setDataSource(file.absolutePath)
+            p.setOnPreparedListener { mp ->
+                reviewReady = true
+                seek.max = Math.max(mp.duration, 1)
+                seek.progress = 0
+                timeLabel.text = "0:00 / ${fmt(mp.duration)}"
+                playerBar.visibility = View.VISIBLE
+                if (autoStart) {
+                    mp.start()
+                    playBtn.text = "⏸ Duraklat"
+                    svcText("Kayıt dinleniyor")
+                } else {
+                    playBtn.text = "▶ Oynat"
+                }
+            }
+            p.setOnCompletionListener { playBtn.text = "▶ Oynat" }
+            p.setOnErrorListener { _, what, extra ->
+                logError("oynatici", Exception("what=$what extra=$extra"))
+                status.text = "Oynatıcı hatası ($what/$extra)"
+                closePlayer()
+                true
+            }
+            review = p
+            p.prepareAsync()
+        } catch (e: Exception) {
+            logError("oynatici acma", e)
+            status.text = "Oynatıcı açılamadı: ${e.message}"
+        }
+    }
+
+    private fun togglePlay() {
+        val rp = review ?: return
+        if (!reviewReady) return
+        try {
+            if (rp.isPlaying) {
+                rp.pause()
+                playBtn.text = "▶ Oynat"
+            } else {
+                if (rp.currentPosition >= rp.duration - 300) seekReview(0)
+                rp.start()
+                playBtn.text = "⏸ Duraklat"
+                ensureService("Kayıt dinleniyor")
+            }
+        } catch (e: Exception) {
+            logError("oynat/duraklat", e)
+        }
+    }
+
+    // ---------- arayuz dongusu ----------
+    private val uiTick = object : Runnable {
+        override fun run() {
+            try { tickUi() } catch (_: Exception) {}
+            handler.postDelayed(this, 50)
+        }
+    }
+
+    private fun tickUi() {
+        var pos = -1L
+        val p = player
+        val rp = review
+        if (running && p != null) {
+            pos = p.currentPosition.toLong()
+        } else if (rp != null && reviewReady) {
+            val cur = rp.currentPosition
+            pos = cur.toLong()
+            if (!dragging) {
+                seek.progress = cur
+                timeLabel.text = "${fmt(cur)} / ${fmt(rp.duration)}"
+                playBtn.text = if (rp.isPlaying) "⏸ Duraklat" else "▶ Oynat"
+            }
+        }
+        if (pos >= 0) updateLyricsAt(pos)
+        tickCount++
+        if (tickCount % 20 == 0) watchdog()
     }
 
     private fun updateStrengthBtn() {
         val name = when (strength) { 1 -> "hafif"; 3 -> "güçlü"; else -> "orta" }
         strengthBtn.text = "Vokal bastırma gücü: $strength ($name) – değiştirmek için dokun"
+    }
+
+    private fun detach(v: View) {
+        (v.parent as? ViewGroup)?.removeView(v)
+    }
+
+    private fun applyLayout() {
+        val land = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        listOf(status, input, lyricView, nextView, playerBar, scroll).forEach { detach(it) }
+        val r = LinearLayout(this).apply { setBackgroundColor(Color.parseColor("#121212")) }
+        if (land) {
+            r.orientation = LinearLayout.HORIZONTAL
+            r.setPadding(32, 24, 32, 16)
+            val left = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            left.addView(status)
+            left.addView(input)
+            left.addView(lyricView, LinearLayout.LayoutParams(-1, 0, 1f))
+            left.addView(nextView)
+            left.addView(playerBar)
+            r.addView(left, LinearLayout.LayoutParams(0, -1, 1f))
+            r.addView(scroll, LinearLayout.LayoutParams(0, -1, 1f))
+        } else {
+            r.orientation = LinearLayout.VERTICAL
+            r.setPadding(32, 64, 32, 24)
+            r.addView(status)
+            r.addView(input)
+            r.addView(lyricView, LinearLayout.LayoutParams(-1, 0, 1f))
+            r.addView(nextView)
+            r.addView(playerBar)
+            r.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1.3f))
+        }
+        setContentView(r)
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        applyLayout()
+    }
+
+    override fun onBackPressed() {
+        // Geri tusu uygulamayi kapatmaz, arka plana atar (islem devam eder)
+        moveTaskToBack(true)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -203,16 +408,14 @@ class MainActivity : Activity() {
             { recFile },
             { instrFile },
             { musicVol },
+            { recorder != null },
             { t -> status.text = t },
             { m -> dlog(m) },
-            { f, n, mime -> copyToDownloads(f, n, mime) }
+            { f, n, mime -> copyToDownloads(f, n, mime) },
+            { t -> ensureService(t) },
+            { closePlayer() },
+            { f, auto -> openPlayer(f, auto) }
         )
-
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#121212"))
-            setPadding(32, 64, 32, 24)
-        }
 
         status = TextView(this).apply {
             setTextColor(Color.LTGRAY); textSize = 13f
@@ -236,6 +439,49 @@ class MainActivity : Activity() {
         fun btn(label: String, onClick: () -> Unit) = Button(this).apply {
             text = label
             setOnClickListener { onClick() }
+        }
+
+        // --- oynatici cubugu ---
+        seek = SeekBar(this).apply {
+            max = 1000
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                    if (fromUser) {
+                        timeLabel.text = "${fmt(p)} / ${fmt(seek.max)}"
+                        seekReview(p)
+                    }
+                }
+                override fun onStartTrackingTouch(s: SeekBar?) { dragging = true }
+                override fun onStopTrackingTouch(s: SeekBar?) {
+                    dragging = false
+                    seekReview(seek.progress)
+                }
+            })
+        }
+        timeLabel = TextView(this).apply {
+            setTextColor(Color.LTGRAY); textSize = 13f
+            text = "0:00 / 0:00"
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        playBtn = btn("▶ Oynat") { togglePlay() }
+        val playRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(playBtn, LinearLayout.LayoutParams(0, -2, 1.2f))
+            addView(timeLabel, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(btn("✕ Kapat") { closePlayer() }, LinearLayout.LayoutParams(0, -2, 1f))
+        }
+        playerBar = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#1E1E1E"))
+            setPadding(16, 12, 16, 12)
+            visibility = View.GONE
+            addView(TextView(context).apply {
+                text = "OYNATICI – kaydın + müzik (çubuğa dokun, istediğin yere git)"
+                setTextColor(Color.GRAY); textSize = 11f
+            })
+            addView(seek)
+            addView(playRow)
         }
 
         // --- muzik sesi ---
@@ -291,7 +537,11 @@ class MainActivity : Activity() {
             addView(btn("veya: LRC dosyası seç") { pickFile(2) })
             addView(btn("BAŞLA 1 (indir + vokal ayır)") { onStartClicked() })
             addView(btn("BAŞLA 2 (vokalsiz müzik + kayıt)") { startStage2(false) })
-            addView(btn("DURDUR") { stopSession(); status.text = "Durduruldu." })
+            addView(btn("DURDUR") {
+                val had = recorder != null
+                stopSession(true)
+                if (!had) status.text = "Durduruldu."
+            })
             addView(offsetRow)
             addView(btn("Kaydırmayı sıfırla (0)") {
                 offsetMs = 0
@@ -299,25 +549,23 @@ class MainActivity : Activity() {
                 status.text = "Söz kaydırma: 0 sn"
             })
             addView(btn("SENKRON: sıradaki satır ŞİMDİ başlıyor") { syncToNow() })
-            addView(btn("Kaydı dinle") { playRecording() })
+            addView(btn("KAYDI DİNLE (oynatıcıda aç)") { fx.playMix(true) })
             addView(fx.build())
+            addView(btn("Arka plan için pil kısıtlamasını kaldır") { askBattery() })
             addView(btn("Yapay zekâ modelini önceden indir (bir kez)") { preloadModels() })
             addView(btn("Ayrılmış şarkı önbelleğini sil") { clearCache() })
             addView(btn("DEBUG KAYDET (İndirilenler)") { saveDebug() })
         }
-        val scroll = ScrollView(this).apply { addView(controls) }
+        scroll = ScrollView(this).apply { addView(controls) }
 
-        root.addView(status)
-        root.addView(input)
-        root.addView(lyricView, LinearLayout.LayoutParams(-1, 0, 1f))
-        root.addView(nextView)
-        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1.3f))
-
-        setContentView(root)
+        applyLayout()
+        handler.post(uiTick)
     }
 
     private fun preloadModels() {
         status.text = "Model indiriliyor..."
+        modelBusy = true
+        ensureService("Model indiriliyor...")
         Thread {
             try {
                 ModelStore.ensure(this) { label, pct ->
@@ -328,6 +576,8 @@ class MainActivity : Activity() {
             } catch (e: Exception) {
                 logError("model indirme", e)
                 runOnUiThread { status.text = "Model indirilemedi: ${e.message}\n('DEBUG KAYDET' butonuna bas)" }
+            } finally {
+                modelBusy = false
             }
         }.start()
     }
@@ -456,7 +706,7 @@ class MainActivity : Activity() {
         return try {
             val u = "https://lrclib.net/api/search?q=" + URLEncoder.encode(q, "UTF-8")
             val conn = URL(u).openConnection()
-            conn.setRequestProperty("User-Agent", "KaraokeApp/7.0")
+            conn.setRequestProperty("User-Agent", "KaraokeApp/8.0")
             val txt = conn.getInputStream().bufferedReader().use { it.readText() }
             val arr = JSONArray(txt)
             var best: Pair<String, Double>? = null
@@ -601,9 +851,8 @@ class MainActivity : Activity() {
         return sp
     }
 
-    private fun updateLyrics() {
-        val p = player ?: return
-        val pos = p.currentPosition.toLong() - offsetMs
+    private fun updateLyricsAt(rawPos: Long) {
+        val pos = rawPos - offsetMs
         if (lines.isEmpty()) {
             lyricView.text = "♪"
             return
@@ -628,6 +877,11 @@ class MainActivity : Activity() {
         val need = mutableListOf<String>()
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             need.add(Manifest.permission.RECORD_AUDIO)
+        }
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            need.add(Manifest.permission.POST_NOTIFICATIONS)
         }
         if (Build.VERSION.SDK_INT < 29 &&
             checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
@@ -668,6 +922,7 @@ class MainActivity : Activity() {
 
     private fun startStage1() {
         stopSession()
+        closePlayer()
         val myId = ++sessionId
         stage = 1
         analysis = null
@@ -677,6 +932,7 @@ class MainActivity : Activity() {
         plannedOffset = 0
         lyricView.text = ""
         nextView.text = ""
+        ensureService("Şarkı hazırlanıyor...")
 
         val first = lines.firstOrNull()?.start ?: -1L
         val url = streamUrl
@@ -823,8 +1079,10 @@ class MainActivity : Activity() {
             return
         }
         stopSession()
+        closePlayer()
         stage = 2
         offsetMs = plannedOffset
+        if (auto) svcText("Çalıyor ve kaydediyor...") else ensureService("Çalıyor ve kaydediyor...")
         dlog("BASLA2 (${if (auto) "otomatik" else "elle"}): offset=$offsetMs vokalsiz=${instrFile != null} " +
             "muzik sesi=${(musicVol * 100).toInt()}%")
         beginPlayback(instrFile)
@@ -846,6 +1104,7 @@ class MainActivity : Activity() {
             recorder = r
 
             val p = MediaPlayer()
+            p.setWakeMode(applicationContext, PowerManager.PARTIAL_WAKE_LOCK)
             setSource(p, processed)
             p.setVolume(musicVol, musicVol)
             p.setOnPreparedListener {
@@ -854,7 +1113,7 @@ class MainActivity : Activity() {
                     recorder?.start()
                     it.start()
                     running = true
-                    handler.post(ticker)
+                    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                     status.text = "Çalıyor ve kaydediyor... (kulaklık tak)$syncNote"
                 } catch (e: Exception) {
                     logError("asama2 baslatma", e)
@@ -868,7 +1127,7 @@ class MainActivity : Activity() {
                 stopSession()
                 true
             }
-            p.setOnCompletionListener { stopSession() }
+            p.setOnCompletionListener { stopSession(true) }
             player = p
             status.text = "Başlat 2: müzik yükleniyor..."
             p.prepareAsync()
@@ -879,11 +1138,11 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun stopSession() {
+    private fun stopSession(openPlayer: Boolean = false) {
         sessionId++
         running = false
         stage = 0
-        handler.removeCallbacks(ticker)
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         val hadRecorder = recorder != null
         try { recorder?.stop() } catch (_: Exception) {}
         try { recorder?.release() } catch (_: Exception) {}
@@ -895,40 +1154,33 @@ class MainActivity : Activity() {
         if (hadRecorder) {
             val f = recFile
             if (f != null && f.exists() && f.length() > 0) {
+                if (openPlayer) pendingFx = true
                 status.text = "Kayıt kaydediliyor..."
                 Thread {
                     val ok = copyToDownloads(f, f.name, "audio/mp4")
+                    dlog("Kayit Indirilenler'e ${if (ok) "kaydedildi" else "YAZILAMADI"}: ${f.name}")
                     runOnUiThread {
-                        status.text = if (ok) "Kayıt İndirilenler klasörüne kaydedildi:\n${f.name}"
-                        else "İndirilenlere yazılamadı. Kayıt burada: ${f.absolutePath}"
+                        if (openPlayer) {
+                            fx.playMix(false)
+                            pendingFx = false
+                        } else {
+                            status.text = if (ok) "Kayıt İndirilenler klasörüne kaydedildi:\n${f.name}"
+                            else "İndirilenlere yazılamadı. Kayıt burada: ${f.absolutePath}"
+                        }
                     }
                 }.start()
             }
         }
     }
 
-    private fun playRecording() {
-        val f = recFile
-        if (f == null || !f.exists()) {
-            status.text = "Henüz kayıt yok."
-            return
-        }
-        try {
-            reviewPlayer?.release()
-            reviewPlayer = MediaPlayer().apply {
-                setDataSource(f.absolutePath)
-                prepare()
-                start()
-            }
-        } catch (e: Exception) {
-            logError("kaydı dinle", e)
-            status.text = "Oynatılamadı: ${e.message}"
-        }
-    }
-
     override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
         stopSession()
-        reviewPlayer?.release()
+        closePlayer()
+        if (svcOn) {
+            KeepAliveService.stop(this)
+            svcOn = false
+        }
         super.onDestroy()
     }
 }

@@ -81,6 +81,7 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var volLabel: TextView
     private lateinit var strengthBtn: Button
+    private lateinit var fx: FxPanel
     private val handler = Handler(Looper.getMainLooper())
 
     private val BLUE = Color.parseColor("#2196F3")
@@ -197,6 +198,16 @@ class MainActivity : Activity() {
         musicVol = prefs.getFloat("vol", 0.5f)
         strength = prefs.getInt("strength", 2).coerceIn(1, 3)
 
+        fx = FxPanel(
+            this,
+            { recFile },
+            { instrFile },
+            { musicVol },
+            { t -> status.text = t },
+            { m -> dlog(m) },
+            { f, n, mime -> copyToDownloads(f, n, mime) }
+        )
+
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#121212"))
@@ -289,6 +300,7 @@ class MainActivity : Activity() {
             })
             addView(btn("SENKRON: sıradaki satır ŞİMDİ başlıyor") { syncToNow() })
             addView(btn("Kaydı dinle") { playRecording() })
+            addView(fx.build())
             addView(btn("Yapay zekâ modelini önceden indir (bir kez)") { preloadModels() })
             addView(btn("Ayrılmış şarkı önbelleğini sil") { clearCache() })
             addView(btn("DEBUG KAYDET (İndirilenler)") { saveDebug() })
